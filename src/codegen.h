@@ -177,6 +177,7 @@ struct CodeGen {
     // that never takes a long-distance return still prints the right answer
     // and the checks' cost can be priced (--unsafe-no-rf-check).
     bool norfcheck = false;
+    bool m32 = false;
 
     [[noreturn]] void Fail(Line l, const string &msg) {
         auto s = cat("codegen: ", msg);
@@ -295,7 +296,9 @@ struct CodeGen {
     // This is a C backend storage/ABI choice, not a language size class:
     // packed layout, copying, indexing and lifetime rules stay unchanged.
     static constexpr int64_t NATIVE_VALUE_LIMIT = 4096;
-    bool IsLargeFixed(TypeExpr *t) { return IsFix(t) && FixedSize(t) > NATIVE_VALUE_LIMIT; }
+    int64_t PtrSize() const { return m32 ? 4 : 8; }
+    int64_t NativeValueLimit() const { return m32 ? 256 : NATIVE_VALUE_LIMIT; }
+    bool IsLargeFixed(TypeExpr *t) { return IsFix(t) && FixedSize(t) > NativeValueLimit(); }
     bool NeedsStack(TypeExpr *t) {
         return IsBytesT(t) || IsLargeFixed(t) ||
                (IsRoot(t) && AnyField(t, [&](TypeExpr *ft) { return NeedsStack(ft); }));
@@ -507,6 +510,10 @@ struct CodeGen {
     // thunk reserves for its arguments and its copy of the globals.
     int globalregions = 0;
     unordered_map<FnSpec *, int> thunkregions;
+    unordered_map<FnSpec *, vector<int64_t>> stackslotbounds;
+    vector<int64_t> curslotbounds;
+    vector<int64_t> globalregionbounds;
+    vector<int64_t> mainstackbounds;
     // GS_MAX_STACKS as the program is configured (main.cpp): the most data
     // stacks one thread program may use at once, zero for no limit.
     int64_t maxstacks = 0;
@@ -806,7 +813,7 @@ struct CodeGen {
     void EmitExitRestores(int to);
     void RegisterDefer(Defer *d);
     void EmitDeferBody(Defer *d);
-    string AllocStk(bool forlocal);
+    string AllocStk(bool forlocal, int64_t bound = -1);
     void SaveBase(bool forlocal, const string &stk, const string &basevar);
 
     // Globals keep their names for the whole run; locals are named per
@@ -930,8 +937,9 @@ struct CodeGen {
     // The address of element `i` of a view: typed pointer arithmetic where
     // the elements are typed, byte arithmetic at the element size otherwise.
     string ElemAddr(const ArrView &v, const string &i) {
-        return v.typedelems ? cat(v.elems, " + ", i)
-                            : cat("(", v.elems, ") + ", i, " * ", FixedSize(v.elem));
+        auto ix = m32 ? cat("(ptrdiff_t)(", i, ")") : i;
+        return v.typedelems ? cat(v.elems, " + ", ix)
+                            : cat("(", v.elems, ") + ", ix, " * ", FixedSize(v.elem));
     }
     // A limited array's capacity: static for the C-typed form, read from
     // the header of the runtime-capacity byte form.
@@ -1102,7 +1110,17 @@ struct CodeGen {
     // top, bumping it. All branches of value-producing control constructs
     // construct to the same destination; calls pass the stack down.
 
-    void Bump(const string &stk, const string &n) { L(TopW(stk), " += ", n, ";"); }
+    // Under --m32 the stacks are static and every growth is checked
+    // against the stack's limit first: a write at the top by CheckSpace
+    // before it, a plain bump by gs_bump. The count goes as int64_t, which
+    // the check compares in 64 bits (gs_check_space).
+    void CheckSpace(const string &stk, const string &n) {
+        if (m32) L("gs_check_space(", stk, ", ", n, ");");
+    }
+    void Bump(const string &stk, const string &n) {
+        if (m32) L("gs_bump(", stk, ", ", n, ");");
+        else L(TopW(stk), " += ", n, ";");
+    }
 
     void EmitValStore(const string &stk, TypeExpr *t, const string &x);
     void StoreWhole(const string &p, TypeExpr *t, const string &x);
@@ -1518,8 +1536,9 @@ struct CodeGen {
     // process state that the driver must install before constructing us.
     // A function the extern support declares gets no prototype here.
     CodeGen(Ast &_ast, string_view runtime_ext_text, const vector<string> &headers,
-            bool _norfcheck = false, bool _library = false, int64_t _maxstacks = 0)
-        : ast(_ast), library(_library), norfcheck(_norfcheck), maxstacks(_maxstacks) {
+            bool _norfcheck = false, bool _library = false, int64_t _maxstacks = 0,
+            bool _m32 = false)
+        : ast(_ast), library(_library), norfcheck(_norfcheck), m32(_m32), maxstacks(_maxstacks) {
         for (auto t : ast.alltypes)
             if (t->kind == TY_REF && t->ref->pool) poolglobals.insert(t->ref->pool);
         ComputeRelRootMax();
@@ -1547,7 +1566,19 @@ struct CodeGen {
         EmitProgramInit();
         EmitExports();
         if (!library) EmitMain();
-        if (usesthreads) predefs = "#define GS_NEED_THREADS 1\n";
+        // The width the layout was emitted for, always, so that a C compiler
+        // of the other width refuses the file (runtime.h); under --m32 the
+        // static stacks, and the freestanding runtime its targets want,
+        // which a compile line may take back (-DGS_FREESTANDING=0).
+        Append(predefs, "#define GS_TARGET_32 ", m32 ? 1 : 0, "\n");
+        if (m32)
+            Append(predefs, "#define GS_STATIC_STACKS 1\n"
+                            "#ifndef GS_FREESTANDING\n#define GS_FREESTANDING 1\n#endif\n");
+        if (usesthreads) Append(predefs, "#define GS_NEED_THREADS 1\n");
+        bool needsos = !DlLibs().empty();
+        for (auto sp : usedexterns)
+            if (sp->sf->cname.rfind("gs_os_", 0) == 0) needsos = true;
+        if (needsos) Append(predefs, "#define GS_NEED_OS 1\n");
         // The instance block: with workers each thread reaches its own
         // through gs_gl; without them there is only main's.
         Append(data, "typedef struct {\n", gblock.empty() ? "    uint8_t gs_none;\n" : gblock,

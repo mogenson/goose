@@ -249,8 +249,8 @@ inline int64_t CodeGen::PadAlign(TypeExpr *t) {
         case TY_REF: return t->ref->lenstorage >= 0 ?
                             (t->ref->lenstorage == IS_VARINT ? 1
                                                              : IntSize((IntStorage)t->ref->lenstorage))
-                            : 8;
-        case TY_SLICE: return 8;
+                            : PtrSize();
+        case TY_SLICE: return PtrSize();
         default: return 1;
     }
 }
@@ -306,8 +306,8 @@ inline int64_t CodeGen::FixedSize(TypeExpr *t) {
                 assert(t->ref->lenstorage != IS_VARINT);
                 return IntSize((IntStorage)t->ref->lenstorage);
             }
-            return IsResz(t->ref->sub) ? 16 : 8;
-        case TY_SLICE: return 16;
+            return IsResz(t->ref->sub) ? 2 * PtrSize() : PtrSize();
+        case TY_SLICE: return 2 * PtrSize();
         case TY_STRUCT: {
             // An empty struct takes the one byte C gives it.
             auto sz = StructLayout(SI(t)).size;
@@ -506,10 +506,16 @@ inline void CodeGen::EmitCoreTypes() {
     // region for arrays, struct start for resizable-tailed structs) plus
     // the tail element count. A reference to one points at the header.
     tdecls +=
-        "typedef struct { uint8_t *base; int64_t len; } gs_rhdr;\n"
+        "typedef struct { uint8_t *base; gs_len_t len; } gs_rhdr;\n"
         "typedef struct { gs_rhdr *hdr; gs_stack *stk; } gs_rref;\n"
         "typedef struct { gs_rhdr *hdr; gs_stack *stk; gs_rhdr *fl; gs_stack *flstk; } "
-        "gs_pref;\n\n";
+        "gs_pref;\n";
+    // The layout the byte offsets in this file assume, checked by the C
+    // compiler: pointers of the target's width and the header packed to
+    // two of them, in the program and in a host including its header.
+    Append(tdecls, "typedef char gs_assert_ptr_size[sizeof(void *) == ", PtrSize(), " ? 1 : -1];\n"
+                   "typedef char gs_assert_rhdr_size[sizeof(gs_rhdr) == ", 2 * PtrSize(),
+                   " ? 1 : -1];\n\n");
     used.insert("gs_rhdr");
     used.insert("gs_rref");
     used.insert("gs_pref");
@@ -570,14 +576,14 @@ inline string CodeGen::CT(TypeExpr *t, bool unaligned) {
                 // the element's body may hold this slice (a node type with a
                 // slice of its children): the typedef goes first, the body
                 // after it.
-                Append(tdecls, "typedef struct { ", NameCT(t->sub), " *data; int64_t len; } ",
+                Append(tdecls, "typedef struct { ", NameCT(t->sub), " *data; gs_len_t len; } ",
                        name, ";\n\n");
                 slicects.insert(name);
                 CT(t->sub);
                 return name;
             }
             auto e = IsBytesT(t->sub) ? string("uint8_t") : CT(t->sub);
-            Append(d, "typedef struct { ", e, " *data; int64_t len; } ", name, ";\n");
+            Append(d, "typedef struct { ", e, " *data; gs_len_t len; } ", name, ";\n");
             slicects.insert(name);
             break;
         }

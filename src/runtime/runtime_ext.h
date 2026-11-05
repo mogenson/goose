@@ -11,20 +11,21 @@
 
 #ifdef GS_RUNTIME_OBJECT
 #pragma pack(push, 1)
-typedef struct { uint8_t *base; int64_t len; } gs_rhdr;
+typedef struct { uint8_t *base; gs_len_t len; } gs_rhdr;
 typedef struct { gs_rhdr *hdr; gs_stack *stk; } gs_rref;
-typedef struct { uint8_t *data; int64_t len; } sl_u8;
+typedef struct { uint8_t *data; gs_len_t len; } sl_u8;
 #pragma pack(pop)
 #endif
 
 /* Appends n bytes to the u8[>..] a builder reference points at: the
    resizable's elements top its stack, so the bytes go at the stack top and
-   the header's count grows. */
+   the header's count grows. The same as goose.h's for C compiled apart. */
 static void gs_bld_append(gs_rref b, const void *p, int64_t n) {
     if (n <= 0) return;
+    gs_check_space(b.stk, n);
     memcpy(b.stk->top, p, (size_t)n);
     b.stk->top += n;
-    b.hdr->len += n;
+    b.hdr->len += (gs_len_t)n;
 }
 
 /* ffi's cstr and bytes (stdlib/ffi.goose): the bytes at a pointer a C
@@ -237,6 +238,7 @@ static int64_t gs_ctz(uint64_t x) {
 #endif
 }
 
+#if GS_NEED_OS || defined(GS_SEPARATE_RUNTIME)
 GS_API uint8_t gs_os_read_file(sl_u8 path, gs_rref out);
 GS_API uint8_t gs_os_write_file(sl_u8 path, sl_u8 data);
 GS_API uint8_t gs_os_write_file_atomic(sl_u8 path, sl_u8 data);
@@ -262,6 +264,7 @@ GS_API int64_t gs_os_time_ns(void);
 GS_API int64_t gs_os_clock_ns(void);
 GS_API void gs_os_sleep_ms(int64_t ms);
 GS_API uint64_t gs_os_random_u64(void);
+#endif
 /* os.trim_memory: discards unused complete pages of this thread program's
    data stacks. Defined with the region registry it walks (runtime_impl.h),
    but declared here like the other os primitives, so that no prototype is

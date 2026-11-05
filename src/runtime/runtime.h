@@ -78,6 +78,48 @@ typedef uint64_t gs_u64 GS_ALIGN1;
 typedef float gs_f32 GS_ALIGN1;
 typedef double gs_f64 GS_ALIGN1;
 
+/* The target's width, which decides the layout the compiler emitted for:
+   pointers and the lengths of slices and resizable headers (gs_len_t) are
+   4 bytes on a 32-bit target (--m32), 8 otherwise. The generated program
+   defines it; the runtime object, built for the host, takes the host's. A
+   C compiler of the other width would lay the packed types out otherwise
+   than the byte offsets in the generated code, so it is refused. */
+#ifndef GS_TARGET_32
+#if UINTPTR_MAX == 0xffffffffu
+#define GS_TARGET_32 1
+#else
+#define GS_TARGET_32 0
+#endif
+#endif
+#if GS_TARGET_32 && UINTPTR_MAX != 0xffffffffu
+#error "this C was generated for a 32-bit target (goose --m32): compile it with a 32-bit C compiler"
+#elif !GS_TARGET_32 && UINTPTR_MAX == 0xffffffffu
+#error "this C was generated for a 64-bit target: generate it with goose --m32 for a 32-bit C compiler"
+#endif
+
+/* Data stacks in a static arena with software limit checks, which the
+   compiler emits for --m32, rather than in reserved address space behind
+   guard pages: the only form without virtual memory. */
+#ifndef GS_STATIC_STACKS
+#define GS_STATIC_STACKS GS_TARGET_32
+#endif
+
+/* A libc-only target without the POSIX layer: no dlopen, no threads, no
+   stdio locking, no directory listing, and C call stacks too small for
+   large path buffers (Zephyr, WASI). Independent of the width: a 32-bit
+   Linux has all of those. --m32 defines it, since the targets it exists
+   for are such; -DGS_FREESTANDING=0 on the compile line takes it back. */
+#ifndef GS_FREESTANDING
+#define GS_FREESTANDING 0
+#endif
+
+#if GS_TARGET_32
+typedef int32_t gs_len_t;
+#else
+typedef int64_t gs_len_t;
+#endif
+typedef gs_len_t gs_ulen_t GS_ALIGN1;
+
 /* Every float operation rounds on its own. A C compiler may otherwise
    contract a multiply and an add into one fused rounding wherever the target
    has FMA (arm64, and x86-64 once AVX-512 or -march=native turns it on):
@@ -104,6 +146,9 @@ typedef double gs_f64 GS_ALIGN1;
 #ifndef GS_NEED_THREADS
 #define GS_NEED_THREADS 0
 #endif
+#ifndef GS_NEED_OS
+#define GS_NEED_OS 0
+#endif
 #ifndef GS_DEBUG
 #define GS_DEBUG 0          /* 1: overflow, `as` range, and tag checks (§9.3). */
 #endif
@@ -115,11 +160,23 @@ typedef double gs_f64 GS_ALIGN1;
 #ifndef GS_MAX_STACKS
 #define GS_MAX_STACKS 1024
 #endif
+/* Each of the next three has a static-stack default after its usual one.
+   The compiler's --stacks report reads the defaults from this text
+   (StackConfigOf, main.cpp): the first spelling of each is the usual one,
+   the second the static stacks', so keep them in that order. */
 #ifndef GS_STACK_RESERVE
+#if !GS_STATIC_STACKS
 #define GS_STACK_RESERVE (2048ull << 20)  /* Address space reserved per stack. */
+#else
+#define GS_STACK_RESERVE (64ull << 10)    /* The size of a dynamic stack in the static arena. */
+#endif
 #endif
 #ifndef GS_STACK_GAP
+#if !GS_STATIC_STACKS
 #define GS_STACK_GAP (1ull << 20)   /* Unmapped tail so runaway growth aborts. */
+#else
+#define GS_STACK_GAP 0ull           /* The limit check needs no gap. */
+#endif
 #endif
 /* The address space the program means to spend on data stack regions over
    every thread program at once, which is what caps hardware_threads()
@@ -127,7 +184,11 @@ typedef double gs_f64 GS_ALIGN1;
    worker's. Not enforced at reservation; what the platform refuses is
    retried smaller (gs_reserve_region). */
 #ifndef GS_STACK_BUDGET
+#if !GS_STATIC_STACKS
 #define GS_STACK_BUDGET (32ull << 40)
+#else
+#define GS_STACK_BUDGET (16ull << 20)
+#endif
 #endif
 #ifndef GS_STACK_STATS
 #define GS_STACK_STATS 0    /* 1: each thread program reports its stack use as it ends. */
@@ -249,6 +310,16 @@ GS_API GS_NORETURN void gs_asfail_f(const char *why, double d, int f32, const ch
 #define GS_IDX(i, n, f, l) \
     ((uint64_t)(i) < (uint64_t)(n) ? (i) \
                                    : (gs_idxfail((int64_t)(i), (n), (f), (l)), (int64_t)0))
+/* The same for an index of a type of 32 bits or fewer on a 32-bit target,
+   in one 32-bit comparison. Its result is the index as int32_t, which is
+   the index itself only while the length is below 2^31: a data stack is
+   at most the 2 GB --stack-reserve allows there, so an array on one is,
+   and a slice over other memory would have to span half the address
+   space to break it. */
+#define GS_IDX32(i, n, f, l) \
+    ((uint32_t)(int32_t)(i) < (uint32_t)(n) \
+         ? (int32_t)(i) \
+         : (gs_idxfail((int64_t)(i), (int64_t)(n), (f), (l)), (int32_t)0))
 
 /* Statically unreachable spots (e.g. an ADT tag no variant matches): checked
    in debug builds, an optimizer hint in release. */
@@ -287,8 +358,13 @@ GS_API GS_NORETURN void gs_asfail_f(const char *why, double d, int f32, const ch
    (the generated code gathers declarations at the top of a function,
    outside the GS_VEC test) and never as a parameter or result, so code
    built for one instruction set never hands a vector to code built for
-   another, which the x86-64 ABI forbids for wide vectors. */
-#if !defined(GS_VEC) && (defined(__clang__) || defined(__GNUC__)) && !defined(__TINYC__)
+   another, which the x86-64 ABI forbids for wide vectors.
+
+   A freestanding target has no vector unit worth the code the 32- and
+   64-byte forms expand to member by member (Cortex-M, wasm32 without
+   SIMD), so it keeps the scalar form; a 32-bit target with one may define
+   GS_VEC=1 itself. */
+#if !defined(GS_VEC) && !GS_FREESTANDING && (defined(__clang__) || defined(__GNUC__)) && !defined(__TINYC__)
 #define GS_VEC 1
 #endif
 #if GS_VEC
@@ -452,6 +528,20 @@ static void gs_memcpy(void *dst, const void *src, size_t n) {
     uint8_t *d = (uint8_t *)dst;
     const uint8_t *s = (const uint8_t *)src;
     if (n <= 16) {
+#if GS_TARGET_32
+        if (n > 8) {
+            uint32_t a0 = gs_ld32(s), a1 = gs_ld32(s + 4);
+            uint32_t b0 = gs_ld32(s + n - 8), b1 = gs_ld32(s + n - 4);
+            GS_MEMCPY(d, &a0, 4);
+            GS_MEMCPY(d + 4, &a1, 4);
+            GS_MEMCPY(d + n - 8, &b0, 4);
+            GS_MEMCPY(d + n - 4, &b1, 4);
+        } else if (n >= 4) {
+            uint32_t a = gs_ld32(s), b = gs_ld32(s + n - 4);
+            GS_MEMCPY(d, &a, 4);
+            GS_MEMCPY(d + n - 4, &b, 4);
+        } else
+#else
         if (n >= 8) {
             uint64_t a = gs_ld64(s), b = gs_ld64(s + n - 8);
             GS_MEMCPY(d, &a, 8);
@@ -460,7 +550,9 @@ static void gs_memcpy(void *dst, const void *src, size_t n) {
             uint32_t a = gs_ld32(s), b = gs_ld32(s + n - 4);
             GS_MEMCPY(d, &a, 4);
             GS_MEMCPY(d + n - 4, &b, 4);
-        } else if (n) {
+        } else
+#endif
+        if (n) {
             uint8_t a = s[0], b = s[n >> 1], c = s[n - 1];
             d[0] = a;
             d[n >> 1] = b;
@@ -488,19 +580,41 @@ static void gs_memmove(void *dst, const void *src, size_t n) {
    enough for the C compiler to inline where the length is known. */
 static GS_NOINLINE int gs_memeq_long(const uint8_t *p, const uint8_t *q, size_t n) {
     if (n > 256) return memcmp(p, q, n) == 0;
+#if GS_TARGET_32
+    for (size_t i = 0; i + 16 < n; i += 16)
+        if ((gs_ld32(p + i) ^ gs_ld32(q + i)) |
+            (gs_ld32(p + i + 4) ^ gs_ld32(q + i + 4)) |
+            (gs_ld32(p + i + 8) ^ gs_ld32(q + i + 8)) |
+            (gs_ld32(p + i + 12) ^ gs_ld32(q + i + 12)))
+            return 0;
+    return ((gs_ld32(p + n - 16) ^ gs_ld32(q + n - 16)) |
+            (gs_ld32(p + n - 12) ^ gs_ld32(q + n - 12)) |
+            (gs_ld32(p + n - 8) ^ gs_ld32(q + n - 8)) |
+            (gs_ld32(p + n - 4) ^ gs_ld32(q + n - 4))) == 0;
+#else
     for (size_t i = 0; i + 16 < n; i += 16)
         if ((gs_ld64(p + i) ^ gs_ld64(q + i)) | (gs_ld64(p + i + 8) ^ gs_ld64(q + i + 8)))
             return 0;
     return ((gs_ld64(p + n - 16) ^ gs_ld64(q + n - 16)) |
             (gs_ld64(p + n - 8) ^ gs_ld64(q + n - 8))) == 0;
+#endif
 }
 
 static int gs_memeq(const void *a, const void *b, size_t n) {
     const uint8_t *p = (const uint8_t *)a, *q = (const uint8_t *)b;
+#if GS_TARGET_32
+    if (n >= 4 && n <= 8)
+        return ((gs_ld32(p) ^ gs_ld32(q)) | (gs_ld32(p + n - 4) ^ gs_ld32(q + n - 4))) == 0;
+    if (n > 8 && n <= 16)
+        return ((gs_ld32(p) ^ gs_ld32(q)) | (gs_ld32(p + 4) ^ gs_ld32(q + 4)) |
+                (gs_ld32(p + n - 8) ^ gs_ld32(q + n - 8)) |
+                (gs_ld32(p + n - 4) ^ gs_ld32(q + n - 4))) == 0;
+#else
     if (n >= 8 && n <= 16)
         return ((gs_ld64(p) ^ gs_ld64(q)) | (gs_ld64(p + n - 8) ^ gs_ld64(q + n - 8))) == 0;
     if (n >= 4 && n < 8)
         return ((gs_ld32(p) ^ gs_ld32(q)) | (gs_ld32(p + n - 4) ^ gs_ld32(q + n - 4))) == 0;
+#endif
     if (n < 4)
         return n == 0 || ((p[0] ^ q[0]) | (p[n >> 1] ^ q[n >> 1]) | (p[n - 1] ^ q[n - 1])) == 0;
     return gs_memeq_long(p, q, n);
@@ -538,11 +652,11 @@ static int gs_memeq(const void *a, const void *b, size_t n) {
 #define GS_MODU(T, a, b, f, l) \
     ((T)(b) ? (T)((T)(a) % (T)(b)) : (gs_divfail((f), (l)), (T)0))
 #define GS_DIVS(T, a, b, f, l) \
-    ((T)(b) ? (T)((int64_t)(T)(a) / (int64_t)(T)(b)) : (gs_divfail((f), (l)), (T)0))
+    ((T)(b) ? (T)((int32_t)(T)(a) / (int32_t)(T)(b)) : (gs_divfail((f), (l)), (T)0))
 #define GS_MODS(T, t, a, b, f, l) \
     ((T)(b) == 0 ? (gs_divfail((f), (l)), (T)0) \
-     : (T)(((t) = (int64_t)(T)(a) % (int64_t)(T)(b)) < 0 \
-               ? (t) + ((T)(b) < 0 ? -(int64_t)(T)(b) : (int64_t)(T)(b)) : (t)))
+     : (T)(((t) = (int32_t)(T)(a) % (int32_t)(T)(b)) < 0 \
+               ? (t) + ((T)(b) < 0 ? -(int32_t)(T)(b) : (int32_t)(T)(b)) : (t)))
 
 #define gs_div_u8(a, b, f, l)  GS_DIVU(uint8_t, a, b, f, l)
 #define gs_div_u16(a, b, f, l) GS_DIVU(uint16_t, a, b, f, l)
@@ -554,7 +668,13 @@ static int gs_memeq(const void *a, const void *b, size_t n) {
 #define gs_mod_u64(a, b, f, l) GS_MODU(uint64_t, a, b, f, l)
 #define gs_mod_i8(t, a, b, f, l)  GS_MODS(int8_t, t, a, b, f, l)
 #define gs_mod_i16(t, a, b, f, l) GS_MODS(int16_t, t, a, b, f, l)
-#define gs_mod_i32(t, a, b, f, l) GS_MODS(int32_t, t, a, b, f, l)
+#define gs_mod_i32(t, a, b, f, l) \
+    ((int32_t)(b) == 0 ? (gs_divfail((f), (l)), (int32_t)0) \
+     : (int32_t)(b) == -1 ? (int32_t)0 \
+     : ((t) = (int32_t)(a) % (int32_t)(b)) < 0 \
+         ? (int32_t)((uint32_t)(t) + ((int32_t)(b) < 0 ? 0u - (uint32_t)(int32_t)(b) \
+                                                       : (uint32_t)(int32_t)(b))) \
+         : (t))
 #define gs_div_i64(a, b, f, l) \
     ((int64_t)(b) == 0 ? (gs_divfail((f), (l)), (int64_t)0) \
      : (int64_t)(a) == INT64_MIN && (int64_t)(b) == -1 ? (gs_divovf((f), (l)), (int64_t)0) \
@@ -582,7 +702,10 @@ GS_DIVOPS_S(i32, int32_t, INT32_MIN, INT32_MAX)
 #else
 #define gs_div_i8(a, b, f, l)  GS_DIVS(int8_t, a, b, f, l)
 #define gs_div_i16(a, b, f, l) GS_DIVS(int16_t, a, b, f, l)
-#define gs_div_i32(a, b, f, l) GS_DIVS(int32_t, a, b, f, l)
+#define gs_div_i32(a, b, f, l) \
+    ((int32_t)(b) == 0 ? (gs_divfail((f), (l)), (int32_t)0) \
+     : (int32_t)(b) == -1 ? (int32_t)(0u - (uint32_t)(int32_t)(a)) \
+     : (int32_t)(a) / (int32_t)(b))
 #endif
 
 #if GS_DEBUG
@@ -663,44 +786,44 @@ static uint64_t gs_shr_u64(uint64_t a, int64_t n) { return a >> (n & 63); }
 
 #else  /* release: each operation is the expression the function returned */
 
-#define gs_add_i8(a, b, f, l)  ((int8_t)((int64_t)(a) + (int64_t)(b)))
-#define gs_sub_i8(a, b, f, l)  ((int8_t)((int64_t)(a) - (int64_t)(b)))
-#define gs_mul_i8(a, b, f, l)  ((int8_t)((int64_t)(a) * (int64_t)(b)))
-#define gs_neg_i8(a, f, l)     ((int8_t)(-(int64_t)(a)))
-#define gs_shl_i8(a, n)  ((int8_t)((uint64_t)(a) << ((n) & 7)))
-#define gs_shr_i8(a, n)  ((int8_t)((int64_t)(a) >> ((n) & 7)))
+#define gs_add_i8(a, b, f, l)  ((int8_t)((uint32_t)(int8_t)(a) + (uint32_t)(int8_t)(b)))
+#define gs_sub_i8(a, b, f, l)  ((int8_t)((uint32_t)(int8_t)(a) - (uint32_t)(int8_t)(b)))
+#define gs_mul_i8(a, b, f, l)  ((int8_t)((int32_t)(int8_t)(a) * (int32_t)(int8_t)(b)))
+#define gs_neg_i8(a, f, l)     ((int8_t)(0u - (uint32_t)(int8_t)(a)))
+#define gs_shl_i8(a, n)        ((int8_t)((uint32_t)(int8_t)(a) << ((n) & 7)))
+#define gs_shr_i8(a, n)        ((int8_t)((int32_t)(int8_t)(a) >> ((n) & 7)))
 
-#define gs_add_i16(a, b, f, l) ((int16_t)((int64_t)(a) + (int64_t)(b)))
-#define gs_sub_i16(a, b, f, l) ((int16_t)((int64_t)(a) - (int64_t)(b)))
-#define gs_mul_i16(a, b, f, l) ((int16_t)((int64_t)(a) * (int64_t)(b)))
-#define gs_neg_i16(a, f, l)    ((int16_t)(-(int64_t)(a)))
-#define gs_shl_i16(a, n) ((int16_t)((uint64_t)(a) << ((n) & 15)))
-#define gs_shr_i16(a, n) ((int16_t)((int64_t)(a) >> ((n) & 15)))
+#define gs_add_i16(a, b, f, l) ((int16_t)((uint32_t)(int16_t)(a) + (uint32_t)(int16_t)(b)))
+#define gs_sub_i16(a, b, f, l) ((int16_t)((uint32_t)(int16_t)(a) - (uint32_t)(int16_t)(b)))
+#define gs_mul_i16(a, b, f, l) ((int16_t)((int32_t)(int16_t)(a) * (int32_t)(int16_t)(b)))
+#define gs_neg_i16(a, f, l)    ((int16_t)(0u - (uint32_t)(int16_t)(a)))
+#define gs_shl_i16(a, n)       ((int16_t)((uint32_t)(int16_t)(a) << ((n) & 15)))
+#define gs_shr_i16(a, n)       ((int16_t)((int32_t)(int16_t)(a) >> ((n) & 15)))
 
-#define gs_add_i32(a, b, f, l) ((int32_t)((int64_t)(a) + (int64_t)(b)))
-#define gs_sub_i32(a, b, f, l) ((int32_t)((int64_t)(a) - (int64_t)(b)))
-#define gs_mul_i32(a, b, f, l) ((int32_t)((int64_t)(a) * (int64_t)(b)))
-#define gs_neg_i32(a, f, l)    ((int32_t)(-(int64_t)(a)))
-#define gs_shl_i32(a, n) ((int32_t)((uint64_t)(a) << ((n) & 31)))
-#define gs_shr_i32(a, n) ((int32_t)((int64_t)(a) >> ((n) & 31)))
+#define gs_add_i32(a, b, f, l) ((int32_t)((uint32_t)(a) + (uint32_t)(b)))
+#define gs_sub_i32(a, b, f, l) ((int32_t)((uint32_t)(a) - (uint32_t)(b)))
+#define gs_mul_i32(a, b, f, l) ((int32_t)((uint32_t)(a) * (uint32_t)(b)))
+#define gs_neg_i32(a, f, l)    ((int32_t)(0u - (uint32_t)(a)))
+#define gs_shl_i32(a, n)       ((int32_t)((uint32_t)(a) << ((n) & 31)))
+#define gs_shr_i32(a, n)       ((int32_t)((int32_t)(a) >> ((n) & 31)))
 
 #define gs_add_u8(a, b)  ((uint8_t)((a) + (b)))
 #define gs_sub_u8(a, b)  ((uint8_t)((a) - (b)))
-#define gs_mul_u8(a, b)  ((uint8_t)((uint64_t)(a) * (uint64_t)(b)))
-#define gs_shl_u8(a, n)  ((uint8_t)((uint64_t)(a) << ((n) & 7)))
-#define gs_shr_u8(a, n)  ((uint8_t)((uint64_t)(a) >> ((n) & 7)))
+#define gs_mul_u8(a, b)  ((uint8_t)((uint32_t)(a) * (uint32_t)(b)))
+#define gs_shl_u8(a, n)  ((uint8_t)((uint32_t)(uint8_t)(a) << ((n) & 7)))
+#define gs_shr_u8(a, n)  ((uint8_t)((uint32_t)(uint8_t)(a) >> ((n) & 7)))
 
 #define gs_add_u16(a, b) ((uint16_t)((a) + (b)))
 #define gs_sub_u16(a, b) ((uint16_t)((a) - (b)))
-#define gs_mul_u16(a, b) ((uint16_t)((uint64_t)(a) * (uint64_t)(b)))
-#define gs_shl_u16(a, n) ((uint16_t)((uint64_t)(a) << ((n) & 15)))
-#define gs_shr_u16(a, n) ((uint16_t)((uint64_t)(a) >> ((n) & 15)))
+#define gs_mul_u16(a, b) ((uint16_t)((uint32_t)(a) * (uint32_t)(b)))
+#define gs_shl_u16(a, n) ((uint16_t)((uint32_t)(uint16_t)(a) << ((n) & 15)))
+#define gs_shr_u16(a, n) ((uint16_t)((uint32_t)(uint16_t)(a) >> ((n) & 15)))
 
 #define gs_add_u32(a, b) ((uint32_t)((a) + (b)))
 #define gs_sub_u32(a, b) ((uint32_t)((a) - (b)))
-#define gs_mul_u32(a, b) ((uint32_t)((uint64_t)(a) * (uint64_t)(b)))
-#define gs_shl_u32(a, n) ((uint32_t)((uint64_t)(a) << ((n) & 31)))
-#define gs_shr_u32(a, n) ((uint32_t)((uint64_t)(a) >> ((n) & 31)))
+#define gs_mul_u32(a, b) ((uint32_t)((uint32_t)(a) * (uint32_t)(b)))
+#define gs_shl_u32(a, n) ((uint32_t)((uint32_t)(a) << ((n) & 31)))
+#define gs_shr_u32(a, n) ((uint32_t)((uint32_t)(a) >> ((n) & 31)))
 
 #define gs_add_i64(a, b, f, l) ((int64_t)((uint64_t)(a) + (uint64_t)(b)))
 #define gs_sub_i64(a, b, f, l) ((int64_t)((uint64_t)(a) - (uint64_t)(b)))
@@ -907,7 +1030,54 @@ static uint64_t gs_f2uchk(double d, int f32, const char *file, int line) {
 
 typedef struct {
     uint8_t *top;
+#if GS_STATIC_STACKS
+    uint8_t *limit;
+#endif
 } gs_stack;
+
+/* A region's own sizes travel with it: those reserved before a refusal
+   halved the size are larger than those after. */
+typedef struct {
+    uint8_t *base;
+    size_t usable, size;    /* size: with the guard gap */
+    gs_stack *stack;        /* Stable descriptor of the owning data stack. */
+    /* Windows: one past the highest page the fault handler has
+       committed, so gs_trim_memory releases only what was ever committed
+       rather than walking the whole reservation. Unused on POSIX, where
+       the kernel supplies pages on touch. */
+    uint8_t *committed;
+} gs_region;
+
+/* The software limit check of static stacks, before n bytes are written at
+   a stack's top (the generated code's every growth under --m32, and the
+   runtime's own writes at a top). The count is compared in 64 bits: a
+   count past 4 GB on a 32-bit target must fail the check, not pass it
+   truncated. A constant count folds to one 32-bit comparison all the
+   same. Nothing where the stacks are address space behind guard pages. */
+static inline void gs_check_space(gs_stack *s, int64_t n) {
+#if GS_STATIC_STACKS
+    if ((uint64_t)(uintptr_t)(s->limit - s->top) < (uint64_t)n)
+        gs_stack_overflow(s->top == s->limit ? s->top - 1 : s->top);
+#else
+    (void)s;
+    (void)n;
+#endif
+}
+
+static inline uint8_t *gs_bump(gs_stack *s, int64_t n) {
+    gs_check_space(s, n);
+    return s->top += n;
+}
+
+#if GS_STATIC_STACKS
+/* The main program's stacks, regions and arena, which the generated program
+   holds in .bss and hands over before gs_rt_init (gs_static_stacks_setup):
+   sizes[i] is region i's, in reservation order (the stacks' block, then the
+   globals'), and size the arena's, which their sum does not exceed. */
+static gs_stack *gs_static_stks;
+static void gs_static_stacks_setup(uint8_t *arena, size_t size, const size_t *sizes,
+                                   gs_stack *stks, gs_region *regions, int64_t count);
+#endif
 
 /* The program defines what goose.h gives C compiled on its own (gs_stack
    here, gs_rhdr, gs_rref and gs_bld_append after the generated types), so
@@ -1026,8 +1196,16 @@ static void gs_stack_init(gs_stack *s) {
 /* The calling thread program's block of n stacks, each with its region:
    main's from gs_rt_init, a worker's from its entry thunk. */
 static void gs_stack_block(int64_t n) {
-    gs_stks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));
-    if (!gs_stks) gs_panic("out of memory allocating stack block");
+#if GS_STATIC_STACKS
+    if (gs_static_stks) {
+        gs_stks = gs_static_stks;
+        gs_static_stks = NULL;
+    } else
+#endif
+    {
+        gs_stks = (gs_stack *)calloc((size_t)(n > 0 ? n : 1), sizeof(gs_stack));
+        if (!gs_stks) gs_panic("out of memory allocating stack block");
+    }
     for (int64_t i = 0; i < n; i++) gs_stack_init(&gs_stks[i]);
     gs_nstks = n;
 }
@@ -1087,16 +1265,16 @@ static int64_t gs_thread_spawn(void (*entry)(uint8_t *), const void *args, int64
 
 /* Where a run of cnt elements goes in a pool of len elements, taken off the
    freelist: for alloc_slice, and for a slice realloc_slice moves. */
-GS_API int64_t gs_spans_alloc(uint8_t *base, int64_t *n, uint8_t **top, int64_t len,
+GS_API int64_t gs_spans_alloc(uint8_t *base, gs_len_t *n, uint8_t **top, int64_t len,
                               int64_t cnt);
 /* realloc_slice growing the non-empty slice [idx, idx + ol), which does not
    end the array, to cnt elements: where it starts now. The caller copies
    the elements where that moved. */
-GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t len,
+GS_API int64_t gs_spans_regrow(uint8_t *base, gs_len_t *n, uint8_t **top, int64_t len,
                                int64_t idx, int64_t ol, int64_t cnt);
 /* free_slice, and what realloc_slice lets go of: [idx, idx + cnt) back on
    the freelist. */
-GS_API void gs_spans_free(uint8_t *base, int64_t *n, uint8_t **top, int64_t idx, int64_t cnt);
+GS_API void gs_spans_free(uint8_t *base, gs_len_t *n, uint8_t **top, int64_t idx, int64_t cnt);
 
 /* ---------------------------------------------------------------------------
    varint (§3.6): ULEB128; struct/payload/offset values additionally zigzag. */

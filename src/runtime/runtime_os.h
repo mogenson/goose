@@ -2,13 +2,18 @@
    and std's slice_pool's span tree, as runtime_ext.h declares them, which
    this follows. */
 
+#if GS_NEED_OS || defined(GS_RUNTIME_OBJECT)
+
 #include <time.h>
 #ifndef _WIN32
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#if !GS_FREESTANDING
 #include <dirent.h>
 #include <dlfcn.h>
-#include <sys/stat.h>
+#endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
@@ -17,8 +22,14 @@
 /* Paths are UTF-8 on every platform, and reach the C APIs NUL-terminated in
    a buffer of GS_OS_PATH_MAX characters. A path that would not fit, that
    holds a NUL byte (where C would end it) or, on Windows, that is not UTF-8
-   is refused: cut short or read another way, it could name another file. */
+   is refused: cut short or read another way, it could name another file.
+   A freestanding target's C call stacks are a few KB, so its buffer is
+   smaller. */
+#if GS_FREESTANDING
+#define GS_OS_PATH_MAX 256
+#else
 #define GS_OS_PATH_MAX 4096
+#endif
 
 #ifdef _WIN32
 /* Windows names files in UTF-16, which its wide APIs take as it is; the
@@ -132,13 +143,24 @@ GS_API uint8_t gs_os_read_file(sl_u8 path, gs_rref out) {
     if (gs_os_native(path, p) < 0) return 0;
     FILE *f = gs_os_fopen(p, "rb");
     if (!f) return 0;
-    int64_t len = out.hdr->len;
+    gs_len_t len = out.hdr->len;
     uint8_t *top = out.stk->top;
-    uint8_t buf[65536];
     for (;;) {
-        size_t n = fread(buf, 1, sizeof buf, f);
+        size_t chunk = 65536;
+#if GS_STATIC_STACKS
+        size_t avail = (size_t)(out.stk->limit - out.stk->top);
+        if (avail == 0) {
+            int c = fgetc(f);
+            if (c == EOF) break;
+            fclose(f);
+            gs_stack_overflow(out.stk->top == out.stk->limit ? out.stk->top - 1 : out.stk->top);
+        }
+        if (chunk > avail) chunk = avail;
+#endif
+        size_t n = fread(out.stk->top, 1, chunk, f);
         if (n == 0) break;
-        gs_bld_append(out, buf, (int64_t)n);
+        out.stk->top += n;
+        out.hdr->len += (gs_len_t)n;
     }
     int bad = ferror(f);
     fclose(f);
@@ -244,8 +266,10 @@ GS_API uint8_t gs_os_write_file_atomic(sl_u8 path, sl_u8 data) {
         }
         /* The permissions of the file it replaces, which write_file leaves
            as they are, rather than the umask's. */
+#if !GS_FREESTANDING
         struct stat st;
         if (stat(p, &st) == 0) ok = fchmod(fd, st.st_mode & 0777) == 0;
+#endif
         while (ok && left > 0) {
             ssize_t w = write(fd, d, left > (1 << 30) ? (size_t)1 << 30 : (size_t)left);
             if (w < 0 && errno == EINTR) continue;
@@ -377,6 +401,9 @@ GS_API uint8_t gs_os_list_dir(sl_u8 path, gs_rref out) {
     } while (ok && FindNextFileW(h, &e));
     if (ok && GetLastError() != ERROR_NO_MORE_FILES) ok = 0;
     FindClose(h);
+#elif GS_FREESTANDING
+    /* No directory listing without the POSIX layer. */
+    ok = 0;
 #else
     DIR *d = opendir(p);
     if (!d) return 0;
@@ -417,6 +444,11 @@ GS_API void gs_os_flush_stdout(void) { fflush(stdout); }
 #define gs_os_lock_stdin() _lock_file(stdin)
 #define gs_os_unlock_stdin() _unlock_file(stdin)
 #define gs_os_getc_stdin() _getc_nolock(stdin)
+#elif GS_FREESTANDING
+/* One thread program, so no lock; the plain getc is what there is. */
+#define gs_os_lock_stdin() ((void)0)
+#define gs_os_unlock_stdin() ((void)0)
+#define gs_os_getc_stdin() fgetc(stdin)
 #else
 #define gs_os_lock_stdin() flockfile(stdin)
 #define gs_os_unlock_stdin() funlockfile(stdin)
@@ -445,23 +477,44 @@ GS_API uint8_t gs_os_read_line(gs_rref out) {
 
 /* All of stdin. */
 GS_API void gs_os_read_stdin(gs_rref out) {
-    uint8_t buf[65536];
     for (;;) {
-        size_t n = fread(buf, 1, sizeof buf, stdin);
+        size_t chunk = 65536;
+#if GS_STATIC_STACKS
+        size_t avail = (size_t)(out.stk->limit - out.stk->top);
+        if (avail == 0) {
+            int c = fgetc(stdin);
+            if (c == EOF) break;
+            ungetc(c, stdin);
+            gs_stack_overflow(out.stk->top == out.stk->limit ? out.stk->top - 1 : out.stk->top);
+        }
+        if (chunk > avail) chunk = avail;
+#endif
+        size_t n = fread(out.stk->top, 1, chunk, stdin);
         if (n == 0) break;
-        gs_bld_append(out, buf, (int64_t)n);
+        out.stk->top += n;
+        out.hdr->len += (gs_len_t)n;
     }
 }
 
 /* Up to max bytes of stdin; false when none were left. */
 GS_API uint8_t gs_os_read_stdin_max(gs_rref out, int64_t max) {
-    uint8_t buf[65536];
     int64_t got = 0;
     while (got < max) {
-        size_t want = max - got < (int64_t)sizeof buf ? (size_t)(max - got) : sizeof buf;
-        size_t n = fread(buf, 1, want, stdin);
+        size_t want = max - got < 65536 ? (size_t)(max - got) : 65536;
+#if GS_STATIC_STACKS
+        size_t avail = (size_t)(out.stk->limit - out.stk->top);
+        if (avail == 0) {
+            int c = fgetc(stdin);
+            if (c == EOF) break;
+            ungetc(c, stdin);
+            gs_stack_overflow(out.stk->top == out.stk->limit ? out.stk->top - 1 : out.stk->top);
+        }
+        if (want > avail) want = avail;
+#endif
+        size_t n = fread(out.stk->top, 1, want, stdin);
         if (n == 0) break;
-        gs_bld_append(out, buf, (int64_t)n);
+        out.stk->top += n;
+        out.hdr->len += (gs_len_t)n;
         got += (int64_t)n;
     }
     return got > 0;
@@ -590,6 +643,10 @@ static int gs_dl_spelling(const gs_dllib *lib, char *buf) {
 
 GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *binds,
                        int64_t nbinds) {
+#if GS_FREESTANDING
+    (void)libs; (void)binds; (void)nbinds;
+    if (nlibs > 0) gs_panic("dynamic extern libraries need an operating system's loader (GS_FREESTANDING)");
+#else
     for (int64_t l = 0; l < nlibs; l++) {
         char spelling[GS_OS_PATH_MAX], msg[GS_OS_PATH_MAX + 512];
         if (!gs_dl_spelling(&libs[l], spelling)) {
@@ -641,6 +698,7 @@ GS_API void gs_dl_bind(const gs_dllib *libs, int64_t nlibs, const gs_dlbind *bin
             *binds[b].slot = f;
         }
     }
+#endif
 }
 
 GS_API void gs_os_arg(int64_t i, gs_rref out) {
@@ -702,10 +760,12 @@ GS_API int64_t gs_os_time_ns(void) {
     GetSystemTimeAsFileTime(&ft);
     uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
     return (int64_t)(t - 116444736000000000ull) * 100;
-#else
+#elif defined(CLOCK_REALTIME)
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+#else
+    return (int64_t)time(NULL) * 1000000000ll;
 #endif
 }
 
@@ -716,10 +776,12 @@ GS_API int64_t gs_os_clock_ns(void) {
     QueryPerformanceFrequency(&f);
     QueryPerformanceCounter(&c);
     return (int64_t)((double)c.QuadPart * (1000000000.0 / (double)f.QuadPart));
-#else
+#elif defined(CLOCK_MONOTONIC)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
+#else
+    return (int64_t)((double)clock() * (1000000000.0 / (double)CLOCKS_PER_SEC));
 #endif
 }
 
@@ -733,11 +795,13 @@ GS_API void gs_os_sleep_ms(int64_t ms) {
         Sleep(part);
         ms -= part;
     }
-#else
+#elif defined(CLOCK_REALTIME)
     struct timespec ts;
     ts.tv_sec = (time_t)(ms / 1000);
     ts.tv_nsec = (long)((ms % 1000) * 1000000);
     nanosleep(&ts, NULL);
+#else
+    (void)ms;
 #endif
 }
 
@@ -766,6 +830,12 @@ GS_API uint64_t gs_os_random_u64(void) {
 #ifdef _WIN32
     static volatile LONG64 counter;
     uint64_t count = (uint64_t)InterlockedIncrement64(&counter);
+#elif !GS_NEED_THREADS
+    static uint64_t counter;
+    uint64_t count = ++counter;
+#elif GS_TARGET_32
+    static uint32_t counter;
+    uint64_t count = __atomic_add_fetch(&counter, 1, __ATOMIC_SEQ_CST);
 #else
     static uint64_t counter;
     uint64_t count = __atomic_add_fetch(&counter, 1, __ATOMIC_SEQ_CST);
@@ -778,6 +848,8 @@ GS_API uint64_t gs_os_random_u64(void) {
     seed = gs_os_mix64(seed ^ (uint64_t)(uintptr_t)&counter);
     return gs_os_mix64(seed ^ count);
 }
+
+#endif  /* GS_NEED_OS || GS_RUNTIME_OBJECT */
 
 /* ---------------------------------------------------------------------------
    std's slice_pool (stdlib/slice_pool_internal.goose) keeps the span tree
@@ -803,7 +875,7 @@ GS_API uint64_t gs_os_random_u64(void) {
 typedef struct {
     gs_sphead *hd;
     uint8_t *base;
-    int64_t *n;
+    gs_len_t *n;
     uint8_t **top;
     const gs_loc *at;    /* The call that a corrupt tree is reported at. */
     int64_t h, node[GS_SPAN_DEPTH], pos[GS_SPAN_DEPTH];
@@ -833,6 +905,7 @@ static int64_t gs_spc_newnode(gs_spcpath *p) {
         GS_SPCHEAD(p)->chain = GS_SPLEAF(p, i)->link;
         return i;
     }
+    gs_check_space((gs_stack *)p->top, GS_SPAN_NODE);
     i = (*p->n)++;
     memset(GS_SPLEAF(p, i), 0, GS_SPAN_NODE);
     *p->top += GS_SPAN_NODE;
@@ -1213,6 +1286,7 @@ GS_API void gs_slice_pool_free(gs_rref nodes, void *tree, int64_t idx, int64_t c
     GS_SPSTART(&p, tree, nodes, at);
     if (*p.n == 0) {
         /* Node 0 stays zero, the chain's end. */
+        gs_check_space((gs_stack *)p.top, GS_SPAN_NODE);
         memset(p.base, 0, GS_SPAN_NODE);
         *p.n = 1;
         *p.top = p.base + GS_SPAN_NODE;

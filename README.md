@@ -24,6 +24,184 @@ language's type and lifetime rules make this memory model safe to use.
 [![Discord Chat](https://img.shields.io/badge/chat-discord-blue)](https://discord.gg/397eZdbnsR)
 [![Twitter Follow](https://img.shields.io/twitter/follow/wvo.svg?style=social)](https://twitter.com/wvo)
 
+## Experimental 32-Bit & Embedded/Wasm Support (`--m32`)
+
+> **Note:** This repository includes an experimental 32-bit cross-compilation mode (`--m32`) that allows running the Goose compiler on a 64-bit host while emitting standalone, MMU-less 32-bit C code targeting bare-metal/RTOS microcontrollers (such as the Zephyr `qemu_cortex_m3` ARM Cortex-M3 target) and 32-bit WebAssembly (`wasm32-unknown-wasi` and Emscripten).
+
+### Summary of Changes
+
+1. **32-Bit Target Layout (`GS_TARGET_32=1`)**:
+   - **32-bit slice and header lengths (`gs_len_t`)**: Defines `typedef int32_t gs_len_t;` (and `typedef gs_len_t gs_ulen_t GS_ALIGN1;`) under `GS_TARGET_32=1`. Slice structs `sl_T { T *data; gs_len_t len; }` and resizable headers `gs_rhdr { uint8_t *base; gs_len_t len; }` shrink from 16 bytes to **8 bytes**. In the Goose surface language, `.len` remains `i64` (widened on read, narrowed via `gs_len_t` on write) so existing Goose code and the standard library require zero source changes.
+   - **4-byte pointer sizing in codegen**: `CodeGen::PtrSize()` returns `4` instead of `8` under `--m32`, ensuring compile-time layout calculations (`FixedSize`, `PadAlign`, `EmitCoreTypes`) match 32-bit target ABIs (`ILP32`). The generated C always states the width it was laid out for (`#define GS_TARGET_32 0|1`), and `runtime.h` refuses a C compiler of the other width with `#error`; size assertions on `void *` and `gs_rhdr` (`gs_assert_ptr_size`, `gs_assert_rhdr_size`) check the packed layout in the program and in any host that includes its `--header`.
+   - **Reduced native C call-frame threshold**: `CodeGen::NativeValueLimit()` lowers the threshold at which fixed-size aggregates (`LargeFixedOnStack`) spill from the native C call stack to a Goose data stack from `4096` bytes to **`256` bytes**, protecting small RTOS/MCU thread call stacks (typically 1–4 KB).
+2. **Static `.bss` Data Stacks with Heterogeneous Sizing (`GS_STATIC_STACKS=1`)**:
+   - Replaces virtual-memory `mmap` + `PROT_NONE` guard pages with a single 8-byte-aligned static `.bss` buffer (`gs_main_stack_arena`) carved into per-stack regions at startup via `gs_static_stacks_setup(...)`.
+   - **Per-slot size propagation (`BoundStacks`)**: The compiler tracks whether each data-stack slot across the call graph is used only for bounded `FixedLocal` values or for unbounded resizable growth. Bounded slots receive their exact 8-byte-aligned compile-time size in `gs_main_stack_sizes[]`, while unbounded dynamic stacks receive `GS_STACK_RESERVE`.
+   - **Worker threads**: When `GS_NEED_THREADS=1`, main-thread stacks use the static `.bss` arena and spawned worker threads allocate their stack regions on the C heap (`malloc`/`free`) with the same software limit checks.
+3. **Software Data-Stack Overflow Checks & 32-Bit Codegen/Runtime Optimizations**:
+   - Each `gs_stack` carries `{ uint8_t *top; uint8_t *limit; }` under `GS_STATIC_STACKS`.
+   - `cachetops` and construction-region `@@gs` top-pointer caching are disabled under `--m32` so `stk->top` is always live. Every data-stack write or bump calls `gs_check_space(stk, n)` first, which compares the remaining room against the `int64_t` count in 64 bits (so a count past 4 GB fails rather than passing truncated; a constant count folds to one 32-bit comparison) and reports a clean runtime stack-overflow error via `gs_stack_overflow(...)` without relying on `SIGSEGV`/`SIGBUS` handlers. The arena's total is checked by the C preprocessor against `SIZE_MAX`, so a `GS_STACK_RESERVE` the regions would wrap at is a compile error, and the runtime refuses to carve a region past the arena.
+   - **32-bit indexing, pointer scaling, and narrow integer ops**: Under `--m32`, array indexing and bounds checks use 32-bit `GS_IDX32`, pointer offset scaling casts indices to `ptrdiff_t` before multiplying by `sizeof(elem)`, and checked arithmetic/division on `i8`/`i16`/`i32`/`u8`/`u16`/`u32` use 32-bit helpers (`gs_sdiv32`, `gs_udiv32`, etc.) to avoid software `__aeabi_ldivmod` calls on 32-bit MCUs.
+   - **32-bit word copy/compare and integer formatting**: `gs_memcpy` and `gs_memeq` use 4-byte `uint32_t` word loops on 32-bit targets, and `gs_fmt_u64`/`gs_fmt_digits` switch to 32-bit division once the value fits in `uint32_t`.
+   - **Relative reference (`T&<u16>`, `T&<u32>`) range checks**: unchanged from 64-bit mode, and as the spec has them (§3.9): a self-relative offset is signed, so the check is left out only where a root spans at most half the width's range -- `GS_STACK_RESERVE <= 2 GB` for `u32`, `<= 32 KB` for `u16`. With the default 64 KB stacks the `u16` check therefore stays in; `--stack-reserve 32K` or less elides it.
+4. **Target-Agnostic `libc` Runtime (`GS_FREESTANDING`, `GS_NEED_OS` & `GS_NEED_THREADS` Gating)**:
+   - When a program does not import `os` or spawn threads, the generated C depends only on standard ISO C `libc` (`<stdint.h>`, `<stddef.h>`, `<stdlib.h>`, `<string.h>`, `<stdio.h>`, `<math.h>`, `<limits.h>`, `<stdarg.h>`), with zero target-specific `#ifdef`s (`__ZEPHYR__`, `__ARM_EABI__`, or `__wasi__`) in the Goose compiler or runtime.
+   - **`GS_FREESTANDING`** separates "no operating system layer" from "32-bit": it leaves out `dlopen` (`gs_dl_bind` panics if a program needs a dynamic extern library), reports one hardware thread, locks no `stdio` stream, lists no directories, skips `fchmod` in `write_file_atomic`, uses `setjmp` rather than `_setjmp`, keeps the scalar form of the vector helpers (`GS_VEC 0`), and shrinks `GS_OS_PATH_MAX` from `4096` to `256` bytes for small C call stacks. `--m32` defines it as `1` (under `#ifndef`, so `-DGS_FREESTANDING=0` on the compile line restores the POSIX layer for a 32-bit Linux); `GS_TARGET_32` itself only decides layout and the 32-bit arithmetic paths.
+   - `<setjmp.h>` is included only when `GS_NEED_THREADS=1` (for `thread_spawn_contained`), allowing WASI targets to compile without experimental Wasm exception-handling proposals.
+   - `gs_os_read_file`, `gs_os_read_stdin`, and `gs_os_read_stdin_max` read directly into `out.stk->top` (bounded by `out.stk->limit`) instead of allocating a 64 KB `uint8_t buf[65536]` on the C call stack.
+   - Target-specific entry points and shims (Zephyr's `main(void)` calling the program's entry point, which the build names with `-DGS_MAIN=gs_app_main`; ARM semihosting `_exit`; and `clock_gettime`/`nanosleep` over `k_cycle_get_64`/`k_msleep`) live entirely in [`zephyr/harness.c`](zephyr/harness.c).
+
+---
+
+### Compiler Command-Line Arguments for 32-Bit Mode
+
+* **`--m32`**:
+  Enables 32-bit target code generation (`GS_TARGET_32=1`), static `.bss` data stacks (`GS_STATIC_STACKS=1`) and the freestanding runtime (`GS_FREESTANDING=1`).
+  - Takes `-o <file.c>` (or `check`): the C is for another machine, so `run`, `build` and `--jit` refuse it. With `-o`, `--m32` automatically implies **`--standalone`**, embedding the required runtime headers directly into the single generated `.c` file for cross-compilation.
+* **`--stack-reserve <size>`** (interaction with `--m32`):
+  - In standard 64-bit mode, `--stack-reserve` defaults to `2G` (`1G` under sanitizers) and accepts sizes from `64K` (one OS guard page) to `256T`.
+  - In **`--m32`** mode, `--stack-reserve` defaults to **`64K` (`65536` bytes)** per dynamic data stack (with a `0`-byte guard gap) and accepts any size from **`64` bytes** up to **`2G`** (with optional `K`, `M`, or `G` suffixes, e.g., `--stack-reserve 4K` for small MCUs or `--stack-reserve 128M` for memory-intensive benchmarks on Wasm32).
+  - You can also override `GS_STACK_RESERVE` at C compile time via `-DGS_STACK_RESERVE=<bytes>` when compiling a generated `.c` file.
+* **`--stacks`** (interaction with `--m32`):
+  Reports the static data-stack and global-stack count for the main program and any workers using the `--m32` default (`64 KB reserved per stack, 0 bytes guard gap`) or the configured `--stack-reserve`.
+
+```bash
+# Inspect data-stack counts in 32-bit mode:
+./build/goose --m32 --stacks --check samples/01_tour.goose
+
+# Emit standalone 32-bit C with a default 64 KB reserve per dynamic stack:
+./build/goose --m32 samples/01_tour.goose -o tour_m32.c
+
+# Emit standalone 32-bit C with a custom 4 KB reserve per dynamic stack (for 64 KB SRAM MCUs):
+./build/goose --m32 --stack-reserve 4K samples/01_tour.goose -o tour_cm3.c
+```
+
+---
+
+### Building and Running with the Nix Flake (`flake.nix`)
+
+The repository includes a [`flake.nix`](flake.nix) development environment that provides:
+- Host build tools (`cmake`, `ninja`, `clang`)
+- 32-bit WebAssembly toolchain and runner (`wasm32-unknown-wasi-clang`, `lld` / `wasm-ld`, `wasmtime`, `emscripten`)
+- Pre-configured **Zephyr RTOS v3.7.0** workspace (`ZEPHYR_BASE`, `cmsis` module, `west`, `dtc`, `gperf`), 32-bit ARM Cortex-M3 toolchain (`arm-none-eabi-gcc`), and QEMU emulator (`qemu-system-arm`)
+
+#### 1. Enter the Nix Dev Environment and Build the Compiler
+
+```bash
+nix develop path:.
+cmake -B build -GNinja -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+```
+
+#### 2. Compile and Run on 32-Bit WebAssembly (`wasm32-unknown-wasi` + `wasmtime`)
+
+```bash
+# 1. Generate 32-bit standalone C from a Goose sample or benchmark
+./build/goose --m32 samples/01_tour.goose -o /tmp/01_tour.c
+
+# 2. Cross-compile to 32-bit WASI WebAssembly
+wasm32-unknown-wasi-clang -O2 \
+  -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_SIGNAL \
+  /tmp/01_tour.c \
+  -lwasi-emulated-process-clocks -lwasi-emulated-signal -lm \
+  -o /tmp/01_tour.wasm
+
+# 3. Run in Wasmtime (pass --dir=. when the program reads local files)
+wasmtime run --dir=. /tmp/01_tour.wasm
+```
+
+For benchmarks or samples that allocate multi-megabyte datasets, pass `--stack-reserve` (e.g., `--stack-reserve 16M` or `--stack-reserve 128M`):
+
+```bash
+./build/goose --m32 --stack-reserve 128M bench/goose/graph.goose -o /tmp/graph.c
+wasm32-unknown-wasi-clang -O2 \
+  -D_WASI_EMULATED_PROCESS_CLOCKS -D_WASI_EMULATED_SIGNAL \
+  /tmp/graph.c \
+  -lwasi-emulated-process-clocks -lwasi-emulated-signal -lm \
+  -o /tmp/graph.wasm
+wasmtime run /tmp/graph.wasm
+```
+
+#### 3. Compile and Run on Zephyr RTOS `qemu_cortex_m3` (64 KB SRAM Limit)
+
+The repository includes a ready-to-build Zephyr RTOS application in [`zephyr/`](zephyr/) ([`zephyr/CMakeLists.txt`](zephyr/CMakeLists.txt) and [`zephyr/prj.conf`](zephyr/prj.conf)). The Zephyr `qemu_cortex_m3` board emulates a TI Stellaris LM3S6965 (`ti_lm3s6965`, `-cpu cortex-m3 -machine lm3s6965evb`) with **256 KB Flash** at `0x00000000` and **64 KB SRAM** at `0x20000000`.
+
+```bash
+# 1. Generate 32-bit C with an 8 KB per-stack reserve (5 stacks = 40 KB .bss arena)
+./build/goose --m32 --stack-reserve 8K samples/01_tour.goose -o /tmp/01_tour_cm3.c
+
+# 2. Build the Zephyr RTOS firmware image for qemu_cortex_m3
+west build -b qemu_cortex_m3 -d build/zephyr zephyr --pristine -- \
+  -DGOOSE_APP_SRC=/tmp/01_tour_cm3.c
+
+# 3. Inspect Flash (.text) and SRAM (.data + .bss) footprint
+arm-none-eabi-size build/zephyr/zephyr/zephyr.elf
+
+# 4. Boot Zephyr RTOS and execute the Goose program in QEMU Cortex-M3
+west build -d build/zephyr -t run
+```
+
+---
+
+### `--m32` Test Results Across Samples and Benchmarks
+
+#### Samples (`samples/*.goose`)
+
+All non-GUI, single-threaded samples compile and run unmodified in `--m32` mode. Samples whose peak data-stack usage fits within the unmodified **64 KB SRAM** of the Zephyr RTOS `qemu_cortex_m3` target (after accounting for the ~10 KB Zephyr kernel, UART console driver, Newlib C runtime, and thread/interrupt stacks) were verified on both Zephyr `qemu_cortex_m3` and Wasm32; samples requiring > 64 KB of data-stack memory were verified on Wasm32 (`wasmtime`):
+
+| Sample | Data Stack Regions | Zephyr `qemu_cortex_m3` (64 KB SRAM) | Zephyr ELF Footprint (`text` / `data` / `bss`) | Zephyr Flash / RAM Used | Wasm32 (`wasmtime`) | Notes |
+|---|---:|---|---|---|---|---|
+| `01_tour.goose` | 5 | **PASS** (`--stack-reserve 8K`) | `51,576 B` / `2,594 B` / `48,618 B` | `54,176 B` (20.7%) / `50,880 B` (77.6%) | **PASS** (`64K`) | Language tour |
+| `02_memory.goose` | 10 | Needs > 64 KB SRAM | — | — | **PASS** (`16M`) | Pushes 100,000 `Item`s (~800 KB) |
+| `03_strings.goose` | 16 | **PASS** (`--stack-reserve 3K`) | `86,736 B` / `2,594 B` / `57,134 B` | `89,336 B` (34.1%) / `59,392 B` (90.6%) | **PASS** (`64K`) | String builders, splits, formatting |
+| `04_errors.goose` | 4 | **PASS** (`--stack-reserve 10K`) | `59,440 B` / `2,594 B` / `48,630 B` | `62,040 B` (23.7%) / `50,888 B` (77.7%) | **PASS** (`64K`) | Cross-frame `return ... from` |
+| `05_shapes.goose` | 6 | **PASS** (`--stack-reserve 8K`) | `62,692 B` / `2,594 B` / `56,894 B` | `65,292 B` (24.9%) / `59,152 B` (90.3%) | **PASS** (`64K`) | Fixed & variable-mode ADTs (`Shape..`) |
+| `06_functions.goose` | 7 | **PASS** (`--stack-reserve 7K`) | `60,812 B` / `2,594 B` / `51,898 B` | `63,412 B` (24.2%) / `54,160 B` (82.6%) | **PASS** (`64K`) | Generics and function blocks |
+| `07_sieve.goose` | 7 | Needs > 64 KB SRAM | — | — | **PASS** (`16M`) | 10,000,001-byte prime sieve (~10 MB) |
+| `08_bignum.goose` | 8 | **PASS** (`--stack-reserve 6K`) | `57,056 B` / `2,594 B` / `56,918 B` | `59,656 B` (22.8%) / `59,176 B` (90.3%) | **PASS** (`64K`) | Arbitrary-precision arithmetic |
+| `09_sorting.goose` | 11 | Needs > 64 KB SRAM | — | — | **PASS** (`16M`) | Sorts large arrays |
+| `10_sudoku.goose` | 5 | **PASS** (`--stack-reserve 8K`) | `61,260 B` / `2,594 B` / `48,650 B` | `63,864 B` (24.4%) / `50,912 B` (77.7%) | **PASS** (`64K`) | Backtracking solver + `os.time()` |
+| `11_maze.goose` | 4 | **PASS** (`--stack-reserve 10K`) | `58,692 B` / `2,594 B` / `48,638 B` | `61,292 B` (23.4%) / `50,896 B` (77.7%) | **PASS** (`64K`) | Maze generation and BFS pathfinding |
+| `12_huffman.goose` | 8 | **PASS** (`--stack-reserve 6K`) | `59,244 B` / `2,594 B` / `51,798 B` | `61,844 B` (23.6%) / `54,056 B` (82.5%) | **PASS** (`64K`) | Huffman tree encoding/decoding |
+| `13_linked_list.goose` | 4 | **PASS** (`--stack-reserve 10K`) | `56,132 B` / `2,594 B` / `48,646 B` | `58,732 B` (22.4%) / `50,904 B` (77.7%) | **PASS** (`64K`) | `slot_pool` doubly linked list |
+| `14_bst.goose` | 5 | **PASS** (`--stack-reserve 8K`) | `57,000 B` / `2,594 B` / `48,634 B` | `59,604 B` (22.7%) / `50,896 B` (77.7%) | **PASS** (`64K`) | Relative-reference (`Node&<u32>?`) BST |
+| `15_word_freq.goose` | 7 | Needs > 64 KB SRAM | — | — | **PASS** (`16M`) | Reads & indexes `data/alice.txt` (167 KB) |
+| `16_records.goose` | 7 | **PASS** (`--stack-reserve 7K`) | `77,756 B` / `2,594 B` / `51,906 B` | `80,360 B` (30.7%) / `54,168 B` (82.7%) | **PASS** (`64K`) | Variable-size nested records |
+| `17_calc.goose` | 8 | — | — | — | **PASS** (`64K`) | Recursive-descent calculator (`< data/calc.stdin`) |
+| `18_json.goose` | 11 | Needs > 64 KB SRAM | — | — | **PASS** (`16M`) | Parses `data/sample.json` |
+| `19_vm.goose` | 4 | **PASS** (`--stack-reserve 10K`) | `57,652 B` / `2,594 B` / `48,606 B` | `60,256 B` (23.0%) / `50,864 B` (77.6%) | **PASS** (`64K`) | Bytecode VM |
+| `20_life.goose` | 6 | **PASS** (`--stack-reserve 8K`) | `56,392 B` / `2,594 B` / `56,854 B` | `58,996 B` (22.5%) / `59,112 B` (90.2%) | **PASS** (`64K`) | Conway's Game of Life |
+| `21_raytrace.goose` | 7 | Needs > 64 KB SRAM | — | — | **PASS** (`16M`) | Raytracer rendering scene buffer |
+| `22_image_filters.goose` | 8 | Needs > 64 KB SRAM | — | — | **PASS** (`16M`) | Image convolution filters |
+| `25_serialize.goose` | 26 | Needs > 64 KB SRAM | — | — | **PASS** (`16M`) | `to_bytes` / `from_bytes` verification on `alice.txt` |
+| `26_file_tree.goose` | 6 | **PASS** (`--stack-reserve 8K`) | `64,332 B` / `2,594 B` / `56,934 B` | `66,932 B` (25.5%) / `59,192 B` (90.3%) | **PASS** (`64K`) | Two-pool directory tree |
+
+*(GUI samples `27_gfx_cube`–`31_mini_doom` require SDL3 GPU windows; multithreaded samples `23_mandelbrot_threads` and `32_pool_worker_snapshots` require a `pthread`-enabled target.)*
+
+#### Benchmarks (`bench/goose/*.goose`) on 32-Bit Wasm (`wasmtime`)
+
+All 30 standalone benchmark programs in `bench/goose/` compile and pass unmodified in `--m32` mode on `wasm32-unknown-wasi` + `wasmtime`, producing identical output checksums to the 64-bit host while benefiting from 4-byte references and 8-byte slices/headers:
+
+| Benchmark | Regions | `--stack-reserve` | Wasm32 (`wasmtime`) |
+|---|---:|---:|---|
+| `bintrees.goose` | 4 | `128M` | **PASS** |
+| `blur.goose`, `blur_assert.goose`, `blur_rows.goose` | 5 | `128M` | **PASS** |
+| `calc.goose`, `calc_noerr.goose`, `calc_noparen.goose`, `calc_slices.goose` | 5 | `128M` | **PASS** |
+| `graph.goose`, `graph_csr.goose` | 4–6 | `128M` | **PASS** |
+| `interp.goose` | 5 | `128M` | **PASS** |
+| `lru.goose`, `lru_indices.goose`, `lru_nonopt.goose` | 5 | `128M` | **PASS** |
+| `particles.goose`, `particles_scalar.goose` | 3 | `128M` | **PASS** |
+| `push.goose`, `push_ref.goose`, `push_root.goose` | 4–5 | `128M` | **PASS** |
+| `records_var.goose` | 5 | `128M` | **PASS** |
+| `respond.goose`, `respond_stream.goose` | 6–7 | `128M` | **PASS** |
+| `scene.goose` | 5 | `128M` | **PASS** |
+| `sexp.goose` | 5 | `256M` | **PASS** (15.2M variable-size AST nodes + 95.8 MB source text) |
+| `slot_pool_bench.goose` | 5 | `128M` | **PASS** |
+| `strlist.goose` | 4 | `128M` | **PASS** |
+| `sum.goose` | 3 | `128M` | **PASS** |
+| `tree.goose` | 4 | `128M` | **PASS** |
+| `words.goose`, `words_dictionary.goose` | 6 | `128M` | **PASS** |
+
 ## Why Goose
 
 * **Faster than C++ and than safe Rust, while memory safe.** Over sixteen

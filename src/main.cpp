@@ -671,7 +671,8 @@ R"(  --stats               Print what the compile did: the declarations parsed,
   --update              Fetch packages at a tag or branch again (a commit is
                         never fetched again).
   --stack-reserve size  Address space reserved per data stack, from 64K, with a
-                        K, M, G or T suffix (default 2G).
+                        K, M, G or T suffix (default 2G); under --m32 the size
+                        of each growing stack, from 64 to 2G (default 64K).
   --stacks              Report the data stacks the program and each worker can
                         take, and the cap that puts on hardware_threads().
   --no-bce              Keep every bounds check.
@@ -869,6 +870,11 @@ the program at hand.
 Options:
   -o out.c              Write the program's C rather than run it.
   --standalone          Write C that holds the whole runtime and builds alone.
+  --m32                 Write C for a 32-bit target (4-byte references, 8-byte
+                        slices and headers) with its data stacks in a static
+                        arena, checked in software: for a microcontroller or
+                        wasm32. Takes -o, implies --standalone, and sizes each
+                        growing stack by --stack-reserve (default 64K).
   --header out.h        Also write a header for a C host, which supplies main,
                         starts the program through goose_init and may end it
                         through goose_exit.
@@ -1005,14 +1011,22 @@ bool ParseConfigValue(string s, uint64_t &out) {
 // The data stack configuration the generated program compiles with, for
 // the --stacks report: the runtime's defaults (runtime.h), then the -D
 // given, --stack-reserve's among them. A -D the compiler cannot read keeps
-// the default in the report; the C compiler sees it either way.
-CodeGen::StackConfig StackConfigOf(const vector<string> &cdefines) {
+// the default in the report; the C compiler sees it either way. The header
+// defines each of the sizes twice, for stacks in reserved address space
+// first and for the static stacks of --m32 second, and keeps that order
+// for this.
+CodeGen::StackConfig StackConfigOf(const vector<string> &cdefines, bool staticstacks) {
     string_view runtime;
     for (auto &rf : runtime_files)
         if (string_view(rf.name) == "runtime.h") runtime = rf.text;
     auto value = [&](const char *name, uint64_t &out) {
         auto key = cat("#define ", name, " ");
-        if (auto at = runtime.find(key); at != string_view::npos) {
+        auto at = runtime.find(key);
+        if (staticstacks && at != string_view::npos) {
+            auto second = runtime.find(key, at + key.size());
+            if (second != string_view::npos) at = second;
+        }
+        if (at != string_view::npos) {
             auto line = runtime.substr(at + key.size());
             line = line.substr(0, line.find('\n'));
             if (auto c = line.find("/*"); c != string_view::npos) line = line.substr(0, c);
@@ -1348,7 +1362,9 @@ int Main(int argc, char **argv) {
     auto nobce = false, bcetest = false, bcelines = false, norfcheck = false;
     auto stacks = false;
     auto stats = false;
-    auto forcejit = false, standalone = false;
+    auto forcejit = false, standalone = false, m32 = false;
+    uint64_t stackreserve = 0;
+    string stackreservesrc;
     auto json = false, refresh = false, debug = false, verbose = false, dryrun = false;
     auto jsondiag = false;
     string ccrequest;
@@ -1370,17 +1386,10 @@ int Main(int argc, char **argv) {
         else if (arg == "--dump-file" && i + 1 < argc) dumpfile = argv[++i];
         else if (arg == "--specs") specs = true;
         else if (arg == "--stacks") stacks = true;
+        else if (arg == "--m32") m32 = true;
         else if (arg == "--stack-reserve" && i + 1 < argc) {
-            uint64_t size;
-            // A whole page at least, 64 KB being the largest a platform
-            // uses: the runtime rounds a reservation down to whole pages.
-            if (!ParseSize(argv[++i], size) || size < (64ull << 10) || size > (1ull << 48)) {
-                fprintf(stderr, "--stack-reserve takes a size from 64 KB to 256 TB (2^48, "
-                                "goose_spec.md 10.4), with an optional K, M, G or T suffix: %s\n",
-                        argv[i]);
-                return 1;
-            }
-            cdefines.push_back(cat("GS_STACK_RESERVE=", size, "ull"));
+            stackreservesrc = argv[++i];
+            if (!ParseSize(stackreservesrc.c_str(), stackreserve)) stackreserve = 0;
         }
         else if (arg == "--check") nocgen = true;
         else if (arg == "--diagnostics" && i + 1 < argc) {
@@ -1476,6 +1485,30 @@ int Main(int argc, char **argv) {
         }
         else files.push_back(arg);
     }
+    if (!stackreservesrc.empty()) {
+        // 64-bit: a whole page at least, 64 KB being the largest a platform
+        // uses, since the runtime rounds a reservation down to whole pages.
+        // --m32: a static stack of any size up to the 2 GB that keeps every
+        // index below 2^31 (GS_IDX32).
+        uint64_t minres = m32 ? 64ull : (64ull << 10);
+        uint64_t maxres = m32 ? (2ull << 30) : (1ull << 48);
+        if (stackreserve < minres || stackreserve > maxres) {
+            fprintf(stderr, "--stack-reserve takes a size from %s to %s, with an optional %s suffix: %s\n",
+                    m32 ? "64 B" : "64 KB", m32 ? "2 GB" : "256 TB (2^48, goose_spec.md 10.4)",
+                    m32 ? "K, M or G" : "K, M, G or T", stackreservesrc.c_str());
+            return 1;
+        }
+        cdefines.push_back(cat("GS_STACK_RESERVE=", stackreserve, "ull"));
+    }
+    // --m32 writes C for another machine: it cannot run here, by the JIT or
+    // a build, and the C holds the runtime so that it builds there alone.
+    if (m32 && (verb == "run" || verb == "build" || forcejit ||
+                (outname.empty() && !nocgen && verb != "check"))) {
+        fprintf(stderr, "--m32 writes C for a 32-bit target, which this machine cannot run: "
+                        "give -o out.c (or check)\n");
+        return 1;
+    }
+    if (m32 && !outname.empty()) standalone = true;
     if (verbose || dryrun) ProgressPlain();
     if (verb == "toolchain") {
         try {
@@ -1691,8 +1724,8 @@ int Main(int argc, char **argv) {
         string_view runtime_ext_text;
         for (auto &rf : runtime_files)
             if (string_view(rf.name) == "runtime_ext.h") runtime_ext_text = rf.text;
-        auto stackcfg = StackConfigOf(cdefines);
-        CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks);
+        auto stackcfg = StackConfigOf(cdefines, m32);
+        CodeGen cg(ast, runtime_ext_text, includes, norfcheck, library, stackcfg.maxstacks, m32);
         if (stacks) cg.StackReport(msgs, stackcfg);
         // The packages whose native parts the program needs, which a JIT
         // run takes functions from and a build links: its own, when it has

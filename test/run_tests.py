@@ -1784,8 +1784,8 @@ def main():
             return
         sig = re.search(r"^static void walk_g\w*\(([^)]*)\) \{$", cfile.read_text(),
                         re.MULTILINE)
-        want = (r"void \*\w+, int64_t \w+, gs_i64 \w+, gs_rhdr \*\w+, gs_stack \*\w+, "
-                r"void \*\w+, int64_t \w+")
+        want = (r"void \*\w+, gs_len_t \w+, gs_i64 \w+, gs_rhdr \*\w+, gs_stack \*\w+, "
+                r"void \*\w+, gs_len_t \w+")
         if not sig or not re.fullmatch(want, sig[1]):
             r.fail(f"member parameters {f.name}",
                    f"walk's parameters: got {sig[1] if sig else None}")

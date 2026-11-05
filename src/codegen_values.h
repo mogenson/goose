@@ -357,7 +357,7 @@ inline CodeGen::ArrView CodeGen::RawArrayView(const Loc &lv) {
     if (t->kind == TY_SLICE) {
         v.elem = t->sub;
         v.elems = cat(lv.s, ".data");
-        v.len = cat(lv.s, ".len");
+        v.len = cat("(int64_t)(", lv.s, ".len)");
         v.typedelems = !IsBytesT(t->sub);
         return v;
     }
@@ -402,7 +402,7 @@ inline CodeGen::ArrView CodeGen::RawArrayView(const Loc &lv) {
         default:   // Grow / grow-shrink: elements at base, length in the header.
             assert(!lv.val && !lv.lenlv.empty());
             v.elems = cat("(", lv.s, ")");
-            v.len = cat("(", lv.lenlv, ")");
+            v.len = cat("(int64_t)(", lv.lenlv, ")");
             v.lenlv = lv.lenlv;
             return v;
     }
@@ -503,7 +503,7 @@ inline void CodeGen::FixedLocal(TypeExpr *t, string &name, const string &init, b
         L(CT(t), " ", name, init.empty() ? ";" : cat(" = ", init, ";"));
         return;
     }
-    auto stk = AllocStk(forlocal);
+    auto stk = AllocStk(forlocal, FixedSize(t));
     L(CT(t), " *", name, " = (", CT(t), " *)", Top(stk), ";");
     SaveBase(forlocal, stk, cat("(uint8_t *)", name));
     Bump(stk, cat("sizeof(", CT(t), ")"));
@@ -551,7 +551,7 @@ inline string CodeGen::DivX(bool div, IntStorage s, const string &l, const strin
     if (div) return cat("gs_div_", IntSfx(s), "(", a, ", ", b, ", ", LocArgs(line), ")");
     if (IsUnsigned(s)) return cat("gs_mod_", IntSfx(s), "(", a, ", ", b, ", ", LocArgs(line), ")");
     auto t = T();
-    L("int64_t ", t, ";");
+    L(s == IS_I64 ? "int64_t " : "int32_t ", t, ";");
     return cat("gs_mod_", IntSfx(s), "(", t, ", ", a, ", ", b, ", ", LocArgs(line), ")");
 }
 
@@ -599,18 +599,22 @@ inline string CodeGen::ArithX(TType op, TypeExpr *t, const string &l, const stri
         case T_PLUS:  return cat("gs_add_", sfx, "(", l, ", ", r, OvfLocArgs(s, line), ")");
         case T_MINUS: return cat("gs_sub_", sfx, "(", l, ", ", r, OvfLocArgs(s, line), ")");
         case T_MUL:   return cat("gs_mul_", sfx, "(", l, ", ", r, OvfLocArgs(s, line), ")");
-        case T_DIV: case T_MOD:
+        case T_DIV: case T_MOD: {
             if (!nonneg) return DivX(op == T_DIV, s, l, r, line);
-            return cat("(", ct, ")((uint64_t)(", lx, op == T_DIV ? ") / " : ") % ", "(uint64_t)(",
+            auto uct = IntBits(s) <= 32 ? "uint32_t" : "uint64_t";
+            return cat("(", ct, ")((", uct, ")(", lx, op == T_DIV ? ") / (" : ") % (", uct, ")(",
                        rx, "))");
+        }
         case T_BITAND: return cat("(", ct, ")(", lx, " & ", rx, ")");
         case T_BITOR:  return cat("(", ct, ")(", lx, " | ", rx, ")");
         case T_XOR:    return cat("(", ct, ")(", lx, " ^ ", rx, ")");
-        case T_SHL:    return cat("gs_shl_", sfx, "(", l, ", (int64_t)(", r, "))");
-        case T_SHR:
-            if (!nonneg) return cat("gs_shr_", sfx, "(", l, ", (int64_t)(", r, "))");
-            return cat("(", ct, ")((uint64_t)(", lx, ") >> ((int64_t)(", r, ") & ", IntBits(s) - 1,
+        case T_SHL:    return cat("gs_shl_", sfx, "(", l, ", (int32_t)(", r, "))");
+        case T_SHR: {
+            if (!nonneg) return cat("gs_shr_", sfx, "(", l, ", (int32_t)(", r, "))");
+            auto uct = IntBits(s) <= 32 ? "uint32_t" : "uint64_t";
+            return cat("(", ct, ")((", uct, ")(", lx, ") >> ((int32_t)(", r, ") & ", IntBits(s) - 1,
                        "))");
+        }
         default: assert(false); return l;
     }
 }
@@ -648,7 +652,7 @@ inline CodeGen::Loc CodeGen::IndexLoc(Loc lv, Node *idxnode, Line ln, bool nobc)
     if (HasStmts(idxnode)) {
         auto elems = T(), len = T();
         L(v.typedelems ? CT(v.elem) : string("uint8_t"), " *", elems, " = ", v.elems, ";");
-        L("int64_t ", len, " = ", v.len, ";");
+        L(m32 ? "int32_t " : "int64_t ", len, " = ", v.len, ";");
         v.elems = elems;
         v.len = len;
     }
@@ -673,8 +677,15 @@ inline CodeGen::Loc CodeGen::IndexLoc(Loc lv, Node *idxnode, Line ln, bool nobc)
     auto il = Is<IntLit>(idxnode);
     auto statlen = lv.t->kind == TY_ARRAY && lv.t->arr->akind == A_FIXED
                        ? ArrSize(lv.t->arr) : -1;
-    if (nobc || (il && statlen >= 0 && il->val >= 0 && il->val < statlen)) ix = idx;
-    else ix = cat("GS_IDX((int64_t)(", idx, "), ", v.len, ", ", LocArgs(ln), ")");
+    bool idx32 = m32 && idxnode->exprtype && idxnode->exprtype->kind == TY_INT &&
+                 idxnode->exprtype->intstorage != IS_VARINT &&
+                 IntBits(idxnode->exprtype->intstorage) <= 32;
+    if (nobc || (il && statlen >= 0 && il->val >= 0 && il->val < statlen))
+        ix = m32 && !idx32 ? cat("(ptrdiff_t)(", idx, ")") : idx;
+    else if (idx32)
+        ix = cat("GS_IDX32(", idx, ", ", v.len, ", ", LocArgs(ln), ")");
+    else
+        ix = cat("GS_IDX((int64_t)(", idx, "), ", v.len, ", ", LocArgs(ln), ")");
     if (v.typedelems) {
         Loc r;
         r.t = v.elem;
@@ -697,7 +708,9 @@ inline CodeGen::Loc CodeGen::IndexLoc(Loc lv, Node *idxnode, Line ln, bool nobc)
         r.s = cat("(((", CT(v.elem), " *)(", v.elems, "))[", ix, "])");
         return r;
     }
-    return BytesLoc(cat("(", v.elems, " + ", ix, " * ", esz, ")"), v.elem, lv);
+    return BytesLoc(cat("(", v.elems, " + ", m32 && !idx32 ? cat("(ptrdiff_t)(", ix, ")") : ix,
+                        " * ", esz, ")"),
+                    v.elem, lv);
 }
 
 // A path whose address takes no check and calls nothing: a variable, or a

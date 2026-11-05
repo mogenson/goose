@@ -50,16 +50,18 @@ inline bool CodeGen::SimpleText(Call *c, TypeExpr *t) {
 }
 
 inline void CodeGen::RenderLit(Loc &out, const string &text) {
+    CheckSpace(out.stk, cat(text.size()));
     L("GS_MEMCPY(", Top(out.stk), ", ", StrRaw(text), ", ", text.size(), ");");
-    Bump(out.stk, cat(text.size()));
+    L(TopW(out.stk), " += ", text.size(), ";");
     L(out.lenlv, " += ", text.size(), ";");
 }
 
 // nexpr writes at the builder's top and yields the byte count.
 inline void CodeGen::RenderN(Loc &out, const string &nexpr) {
+    CheckSpace(out.stk, "GS_FMT_MAX");
     auto n = T();
     L("int64_t ", n, " = ", nexpr, ";");
-    Bump(out.stk, n);
+    L(TopW(out.stk), " += ", n, ";");
     L(out.lenlv, " += ", n, ";");
 }
 
@@ -141,14 +143,19 @@ inline void CodeGen::RenderLoc(Loc &out, Loc lv, TypeExpr *t, bool nested, Call 
             auto v = ArrayView(lv);
             if (IsU8(elem)) {
                 if (nested) {
-                    RenderN(out, cat("gs_fmt_quoted(", Top(out.stk), ", (const uint8_t *)(",
-                                     v.elems, "), ", v.len, ")"));
+                    CheckSpace(out.stk, cat("2 + 2 * (", v.len, ")"));
+                    auto n = T();
+                    L("int64_t ", n, " = gs_fmt_quoted(", Top(out.stk), ", (const uint8_t *)(",
+                      v.elems, "), ", v.len, ");");
+                    L(TopW(out.stk), " += ", n, ";");
+                    L(out.lenlv, " += ", n, ";");
                 } else {
                     auto n = T();
                     L("int64_t ", n, " = ", v.len, ";");
+                    CheckSpace(out.stk, n);
                     L(CopyFn(), "(", Top(out.stk), ", (const uint8_t *)(", v.elems,
                       "), (size_t)", n, ");");
-                    Bump(out.stk, n);
+                    L(TopW(out.stk), " += ", n, ";");
                     L(out.lenlv, " += ", n, ";");
                 }
                 return;
@@ -516,6 +523,7 @@ inline void CodeGen::EmitFormatInto(Loc lv, Node *a, Line ln, Call *c) {
         L("uint8_t ", src, "[GS_FMT_MAX];");
         L("int64_t ", n, " = ", FmtCall(a, src), ";");
     } else {
+        CheckSpace(lv.stk, "GS_FMT_MAX");
         L("int64_t ", n, " = ", FmtCall(a, Top(lv.stk)), ";");
     }
     // Bytes to copy -- a limited array's, under its capacity check, or a
@@ -526,7 +534,7 @@ inline void CodeGen::EmitFormatInto(Loc lv, Node *a, Line ln, Call *c) {
     }
     // A scalar's text is at the resizable's top already: only the count moves.
     assert(!lv.stk.empty());
-    Bump(lv.stk, n);
+    L(TopW(lv.stk), " += ", n, ";");
     L(v.lenlv, " += ", n, ";");
 }
 
@@ -562,16 +570,19 @@ inline vector<string> CodeGen::EmitStr(Call *c, vector<Node *> &an, Dst d0, Line
         if (!SimpleText(context, t)) {
             auto b = RenderToTemp(a, context);
             L("int64_t ", n, " = ", b.hdr, ".len;");
+            CheckSpace(stk, n);
             L("GS_MEMCPY(", Top(stk), ", ", b.hdr, ".base, (size_t)", n, ");");
         } else if (t->kind == TY_ARRAY || t->kind == TY_SLICE) {
             auto se = GenSrcElems(a);
             L("int64_t ", n, " = ", se.n, ";");
+            CheckSpace(stk, n);
             L(CopyFn(), "(", Top(stk), ", (const uint8_t *)(", se.elems, "), (size_t)",
               n, ");");
         } else {
+            CheckSpace(stk, "GS_FMT_MAX");
             L("int64_t ", n, " = ", FmtCall(a, Top(stk)), ";");
         }
-        Bump(stk, n);
+        L(TopW(stk), " += ", n, ";");
         L(cnt, " += ", n, ";");
     }
     if (!pref.empty()) EmitPrefixPatch(pref, ls, stk, cnt, elems);

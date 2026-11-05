@@ -205,6 +205,7 @@ inline void CodeGen::FindRefAliases(FnSpec *sp) {
 // together.
 inline void CodeGen::PlanTopClasses(FnSpec *sp) {
     topown = topglob = topcap = topdst = reftops = false;
+    if (m32) return;
     auto &fvs = sinfo[sp].freevars;
     auto isparam = [&](const VarDef *v) {
         return std::find(sp->params.begin(), sp->params.end(), v) != sp->params.end();
@@ -374,6 +375,7 @@ inline bool CodeGen::RefTopsOk(FnSpec *sp, bool farreturn) {
 }
 
 inline void CodeGen::ResetFnState() {
+    curslotbounds.clear();
     toporder.clear();
     lenslots.clear();
     growth.clear();
@@ -609,7 +611,7 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
     spexpr = curinfo->needssp ? "gs_sp" : "0";
     FindRefAliases(sp);
     PlanTopClasses(sp);
-    markers = true;
+    markers = !m32;
     PushSc(SC_FN);
     auto params = SigParams(sp, true, er);
     // The spellings are only known once SigParams has named the parameters.
@@ -685,6 +687,12 @@ inline void CodeGen::EmitSpec(FnSpec *sp, bool er) {
         Fail(sp->sf->line, cat("internal: ", curinfo->cname, " uses data stacks without gs_sp"));
     // The element-run twin is the same body: the larger count of the two.
     stackown[sp] = std::max(stackown[sp], stkmax);
+    {
+        auto &sb = stackslotbounds[sp];
+        if (sb.size() < curslotbounds.size()) sb.resize(curslotbounds.size(), 0);
+        for (size_t i = 0; i < curslotbounds.size(); i++)
+            sb[i] = (sb[i] < 0 || curslotbounds[i] < 0) ? -1 : std::max(sb[i], curslotbounds[i]);
+    }
     // The regions and the markers resolve now that every stack this body
     // grows, and where it grows it, is known.
     auto plan = PlanTopCaches();
@@ -932,6 +940,12 @@ inline void CodeGen::EmitGlobalInit() {
     EmitExitRestores(0);
     cscopes.clear();
     stackown[nullptr] = std::max(stackown[nullptr], stkmax);
+    {
+        auto &sb = stackslotbounds[nullptr];
+        if (sb.size() < curslotbounds.size()) sb.resize(curslotbounds.size(), 0);
+        for (size_t i = 0; i < curslotbounds.size(); i++)
+            sb[i] = (sb[i] < 0 || curslotbounds[i] < 0) ? -1 : std::max(sb[i], curslotbounds[i]);
+    }
     auto decls = HoistAggregateDecls(body);
     Append(code, "static void gs_init_globals(void) {\n");
     code += decls;
@@ -955,6 +969,7 @@ inline string CodeGen::GlobalLenLv(VarDef *d) { return RzLenLv(d->type, gnames[d
 inline void CodeGen::InitGlobalStack(VarDef *d) {
     auto stk = gstks[d];
     globalregions++;
+    globalregionbounds.push_back(-1);
     L("gs_stack_init(", stk, ");");
     if (IsResz(d->type) && IsFrameObj(d->type)) {
         // The tail header is set when the value is constructed.
@@ -967,6 +982,7 @@ inline void CodeGen::InitGlobalStack(VarDef *d) {
     if (d->reusable) {
         auto &p = gpools[d];
         globalregions++;
+        globalregionbounds.push_back(-1);
         L("gs_stack_init(", p.second, ");");
         L(p.first, ".base = ", Top(p.second), ";");
         L(p.first, ".len = 0;");
@@ -989,9 +1005,47 @@ inline void CodeGen::EmitProgramInit() {
         EmitThreadThunk(sp, stacks);
         workerregions = std::max(workerregions, stacks + thunkregions[sp]);
     }
+    if (m32) {
+        // The main program's regions, each sized as BoundStacks found it:
+        // a slot only ever holding fixed locals gets their largest, rounded
+        // to the 8 the arena is aligned to; one that grows gets the dynamic
+        // size. Their sum is the arena, which has to fit the target's
+        // size_t: the C preprocessor adds in 64 bits, so it is what refuses
+        // a GS_STACK_RESERVE the regions would wrap at.
+        int64_t total = mainstacks + globalregions, fixedbytes = 0, dynamic = 0;
+        Append(data, "static const size_t gs_main_stack_sizes[", std::max<int64_t>(1, total), "] = {");
+        string arena_expr = "0";
+        for (int64_t i = 0; i < total; i++) {
+            int64_t b = i < mainstacks ? (i < (int64_t)mainstackbounds.size() ? mainstackbounds[(size_t)i] : -1)
+                                       : (i - mainstacks < (int64_t)globalregionbounds.size() ? globalregionbounds[(size_t)(i - mainstacks)] : -1);
+            string sz;
+            if (b >= 0) {
+                auto bytes = std::max<int64_t>(8, (b + 7) & ~int64_t(7));
+                fixedbytes += bytes;
+                sz = cat("((size_t)", bytes, "u)");
+            } else {
+                dynamic++;
+                sz = "((size_t)GS_STACK_RESERVE)";
+            }
+            Append(data, i ? ", " : " ", sz);
+            Append(arena_expr, " + ", sz);
+        }
+        if (total == 0) Append(data, " 0");
+        Append(data, " };\n");
+        Append(data, "#if ", fixedbytes, "ull + ", dynamic, "ull * (GS_STACK_RESERVE) > SIZE_MAX\n"
+                     "#error \"the static data stack arena does not fit the address space: lower "
+                     "GS_STACK_RESERVE (--stack-reserve)\"\n#endif\n");
+        Append(data, "static gs_stack gs_main_stks[", std::max<int64_t>(1, mainstacks), "];\n");
+        Append(data, "static gs_region gs_main_regions[", std::max<int64_t>(1, total), "];\n");
+        Append(data, "static _Alignas(8) uint8_t gs_main_stack_arena[(", arena_expr, ") ? (", arena_expr, ") : 8];\n");
+    }
     Append(code, "static void gs_program_init(int argc, char **argv) {\n"
-                 "    if (gs_program_initialized) return;\n"
-                 "    gs_rt_init(argc, argv, ", mainstacks, ", ", mainstacks + globalregions,
+                 "    if (gs_program_initialized) return;\n");
+    if (m32)
+        Append(code, "    gs_static_stacks_setup(gs_main_stack_arena, sizeof gs_main_stack_arena, "
+                     "gs_main_stack_sizes, gs_main_stks, gs_main_regions, ",
+               mainstacks + globalregions, ");\n");
+    Append(code, "    gs_rt_init(argc, argv, ", mainstacks, ", ", mainstacks + globalregions,
            ", ", workerregions, ");\n");
     // The shared libraries' functions, before a global's initializer could
     // call one: on the main thread, before any worker exists, so the
@@ -1023,8 +1077,8 @@ inline void CodeGen::EmitProgramInit() {
                      MainCall(), "}\n\n");
         Append(code, "void goose_exit(void) {\n"
                      "    if (!gs_program_initialized) return;\n"
-                     "    gs_rt_stop();\n"
-                     "    free(gs_stks);\n"
+                     "    gs_rt_stop();\n",
+                     m32 ? "" : "    free(gs_stks);\n",
                      "    gs_stks = NULL;\n"
                      "    gs_nstks = 0;\n");
         for (auto &q : qnames) Append(code, "    gs_qfree(&", q, ");\n");
@@ -1087,21 +1141,25 @@ inline void CodeGen::EmitExports() {
 inline string CodeGen::ExportHeader() {
     // The scalar aliases as the runtime defines them (runtime.h), which the
     // exported signatures and the type definitions spell their scalars by;
-    // a host's unit that has them already may repeat them.
-    string header = "#pragma once\n#include <stdint.h>\n"
-                    "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)\n"
-                    "#define GS_ALIGN1 __attribute__((aligned(1)))\n"
-                    "#else\n#define GS_ALIGN1\n#endif\n"
-                    "typedef int16_t gs_i16 GS_ALIGN1;\n"
-                    "typedef int32_t gs_i32 GS_ALIGN1;\n"
-                    "typedef int64_t gs_i64 GS_ALIGN1;\n"
-                    "typedef uint16_t gs_u16 GS_ALIGN1;\n"
-                    "typedef uint32_t gs_u32 GS_ALIGN1;\n"
-                    "typedef uint64_t gs_u64 GS_ALIGN1;\n"
-                    "typedef float gs_f32 GS_ALIGN1;\n"
-                    "typedef double gs_f64 GS_ALIGN1;\n"
-                    "typedef struct gs_stack gs_stack;\n"
-                    "#pragma pack(push, 1)\n";
+    // a host's unit that has them already may repeat them. The length type
+    // is the one this build's layout has (--m32 or not), spelled out: the
+    // host has no GS_TARGET_32 to go by.
+    string header = cat("#pragma once\n#include <stdint.h>\n"
+                        "#if (defined(__GNUC__) || defined(__clang__)) && !defined(__TINYC__)\n"
+                        "#define GS_ALIGN1 __attribute__((aligned(1)))\n"
+                        "#else\n#define GS_ALIGN1\n#endif\n"
+                        "typedef int16_t gs_i16 GS_ALIGN1;\n"
+                        "typedef int32_t gs_i32 GS_ALIGN1;\n"
+                        "typedef int64_t gs_i64 GS_ALIGN1;\n"
+                        "typedef uint16_t gs_u16 GS_ALIGN1;\n"
+                        "typedef uint32_t gs_u32 GS_ALIGN1;\n"
+                        "typedef uint64_t gs_u64 GS_ALIGN1;\n"
+                        "typedef float gs_f32 GS_ALIGN1;\n"
+                        "typedef double gs_f64 GS_ALIGN1;\n"
+                        "typedef int", m32 ? 32 : 64, "_t gs_len_t;\n"
+                        "typedef gs_len_t gs_ulen_t GS_ALIGN1;\n"
+                        "typedef struct gs_stack gs_stack;\n"
+                        "#pragma pack(push, 1)\n");
     header += tdecls;
     header += "#pragma pack(pop)\n\n";
     header += "#ifdef __cplusplus\nextern \"C\" {\n#endif\n"
@@ -1112,9 +1170,13 @@ inline string CodeGen::ExportHeader() {
     return header;
 }
 
+// The program's entry point: main, unless a host with a main of its own (an
+// RTOS) names it otherwise on the compile line (-DGS_MAIN=app_main) and
+// calls it from there.
 inline void CodeGen::EmitMain() {
-    Append(code, "int main(int argc, char **argv) {\n    gs_program_init(argc, argv);\n",
-           MainCall(), "    gs_rt_stats();\n    return 0;\n}\n");
+    Append(code, "#ifndef GS_MAIN\n#define GS_MAIN main\n#endif\n"
+                 "int GS_MAIN(int argc, char **argv) {\n    gs_program_init(argc, argv);\n", MainCall(),
+           "    gs_rt_stats();\n    return 0;\n}\n");
 }
 
 }  // namespace goose

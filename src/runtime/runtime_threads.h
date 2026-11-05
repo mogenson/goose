@@ -25,6 +25,9 @@ static int64_t gs_os_threads(void) {
     GetSystemInfo(&si);
     return (int64_t)si.dwNumberOfProcessors;
 }
+#elif GS_FREESTANDING
+/* No scheduler to ask: one hardware thread. */
+static int64_t gs_os_threads(void) { return 1; }
 #else
 #include <unistd.h>
 #ifdef __linux__

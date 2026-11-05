@@ -45,7 +45,7 @@ inline string CodeGen::LenCast(const Loc &lv) {
     auto ak = lv.t->arr->akind;
     if (ak == A_LIMITED) return lv.val ? IntCT(LenStore(lv.t->arr)) : "uint32_t";
     if (ak == A_VAR) return IntCT(LenStore(lv.t->arr));
-    return "int64_t";
+    return "gs_len_t";
 }
 
 inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
@@ -245,8 +245,9 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
                     n = cat("(", nn, "->size - 8 - ", pre, ")");
                 }
                 L(cnt, " = *(gs_i64 *)(", nn, " + 1);");
+                CheckSpace(stk, n);
                 L("GS_MEMCPY(", Top(stk), ", ", image, ", (size_t)", n, ");");
-                Bump(stk, n);
+                L(TopW(stk), " += ", n, ";");
                 L("free(", nn, ");");
                 ind--;
                 L("}");
@@ -265,16 +266,18 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
                 if (poll) L("if (", nn, ") {");
                 else L("{");
                 ind++;
+                CheckSpace(stk, cat(nn, "->size"));
                 L("GS_MEMCPY(", Top(stk), ", ", nn, " + 1, (size_t)", nn, "->size);");
-                Bump(stk, cat(nn, "->size"));
+                L(TopW(stk), " += ", nn, "->size;");
                 L("free(", nn, ");");
                 ind--;
                 if (poll) {
                     // A missed poll still yields a valid (zero) value.
                     L("} else {");
                     ind++;
+                    CheckSpace(stk, cat(MinBytes(t, true)));
                     L("GS_MEMZERO(", Top(stk), ", ", MinBytes(t, true), ");");
-                    Bump(stk, cat(MinBytes(t, true)));
+                    L(TopW(stk), " += ", MinBytes(t, true), ";");
                     ind--;
                 }
                 L("}");
@@ -437,6 +440,10 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
                 // is written once, after the fill.
                 string cur;
                 if (ak != A_LIMITED && !(relref && elem->ref->lenstorage == IS_VARINT)) {
+                    if (m32 && esz > 0)
+                        L("if ((uint64_t)(", nn, " - ", ol, ") > GS_STACK_RESERVE / ", esz,
+                          ") gs_stack_overflow(", Top(lv.stk), ");");
+                    CheckSpace(lv.stk, cat("(", nn, " - ", ol, ") * ", esz));
                     cur = T();
                     L("uint8_t *", cur, " = ", Top(lv.stk), ";");
                 }
@@ -504,6 +511,7 @@ inline vector<string> CodeGen::EmitBuiltin(Call *c, Dst d0) {
             auto x = GenPure(an[1]);
             auto i = T();
             L("int64_t ", i, " = GS_IDX(", x, ", ", lv.lenlv, ", ", LocArgs(ln), ");");
+            CheckSpace(lv.flstk, "8");
             L("*(gs_i64 *)", Top(lv.flstk), " = ", i, ";");
             L(TopW(lv.flstk), " += 8;");
             L(lv.fl, ".len++;");
@@ -721,7 +729,7 @@ inline void CodeGen::EmitAppend(vector<Node *> &an, Line ln) {
     if (ak != A_LIMITED) NoteLen(lv.stk, v.lenlv, lv.lenroot);
     if (fresh && asrun && ak != A_LIMITED) {
         auto nn = T();
-        L("int64_t ", nn, " = 0;");
+        L("gs_len_t ", nn, " = 0;");
         GenAny(src, Dst { DK_STACK, lv.stk, st, nn });
         L(v.lenlv, " += ", nn, ";");
         return;
@@ -750,7 +758,7 @@ inline void CodeGen::EmitAppend(vector<Node *> &an, Line ln) {
     if (auto al = Is<ArrayLit>(src); al && (IsBytesT(elem) || HasRelRef(elem))) {
         if (IsBytesT(elem)) {
             auto nn = T();
-            L("int64_t ", nn, " = 0;");
+            L("gs_len_t ", nn, " = 0;");
             GenArrayLit(al, lv.stk, nn);
             L(v.lenlv, " += ", nn, ";");
             return;
@@ -763,6 +771,8 @@ inline void CodeGen::EmitAppend(vector<Node *> &an, Line ln) {
             L("if (", ol, " + ", count, " > ", LimitedCap(lv), ") gs_abort(GS_E_CAPACITY, ",
               LocArgs(ln), ");");
             at = ElemAddr(v, ol);
+        } else {
+            CheckSpace(lv.stk, cat(count * FixedSize(elem)));
         }
         // The run is a fixed array of the literal's type laid over the slots.
         auto rt = CT(src->exprtype);
@@ -772,7 +782,7 @@ inline void CodeGen::EmitAppend(vector<Node *> &an, Line ln) {
         if (ak == A_LIMITED) {
             L(v.lenlv, " = (", LenCast(lv), ")(", ol, " + ", count, ");");
         } else {
-            Bump(lv.stk, cat(count * FixedSize(elem)));
+            L(TopW(lv.stk), " += ", count * FixedSize(elem), ";");
             L(v.lenlv, " += ", count, ";");
         }
         return;
@@ -821,6 +831,7 @@ inline vector<string> CodeGen::EmitAlloc(Call *c, vector<Node *> &an, Line ln) {
     ind--;
     L("} else {");
     ind++;
+    CheckSpace(lv.stk, cat(esz));
     L(iv, " = ", lv.lenlv, ";");
     ind--;
     L("}");
@@ -1028,8 +1039,9 @@ inline bool CodeGen::BulkDefaultLoop(ForLoop *loop) {
         // The loop would have run into the guard gap; report it the same way.
         L("if ((uint64_t)", limit, " > GS_STACK_RESERVE / ", esz, ") gs_stack_overflow(",
           Top(lv.stk), ");");
+        CheckSpace(lv.stk, cat("(", limit, " - ", first, ") * ", esz));
         L("GS_MEMZERO(", Top(lv.stk), ", (size_t)((", limit, " - ", first, ") * ", esz, "));");
-        Bump(lv.stk, cat("(", limit, " - ", first, ") * ", esz));
+        L(TopW(lv.stk), " += (", limit, " - ", first, ") * ", esz, ";");
         L(view.lenlv, " = ", limit, ";");
         ind--;
         L("}");
@@ -1071,11 +1083,13 @@ inline void CodeGen::EmitRzImage(Loc src, TypeExpr *t, const string &stk, Line l
         auto th = FoTailHdr(t, src.s);
         EmitValStore(stk, ast.inttypes[IS_I64], cat(th, ".len"));
         auto pre = FoPrefixSize(t);
+        CheckSpace(stk, pre);
         L("GS_MEMCPY(", Top(stk), ", &", src.s, ", ", pre, ");");
-        Bump(stk, pre);
+        L(TopW(stk), " += ", pre, ";");
         EmitCopyElems(stk, FoTailArr(t)->arr->sub, cat(th, ".base"), cat(th, ".len"));
         return;
     }
+    CheckSpace(stk, "8");
     auto cntp = T();
     L("gs_i64 *", cntp, " = (gs_i64 *)", Top(stk), ";");
     auto lenv = T();
@@ -1136,9 +1150,10 @@ inline vector<string> CodeGen::EmitThreadSpawn(Call *c, vector<Node *> &an) {
         }
         // Resizable values have an out-of-line header. Transfer a flat
         // image with its count, never a pointer into the spawning instance.
+        CheckSpace(stk, "16");
         auto szp = T();
         L("gs_i64 *", szp, " = (gs_i64 *)", Top(stk), ";");
-        Bump(stk, "8");
+        L(TopW(stk), " += 8;");
         auto cntp = T();
         L("gs_i64 *", cntp, " = (gs_i64 *)", Top(stk), ";");
         EmitValStore(stk, ast.inttypes[IS_I64], "0");
@@ -1146,21 +1161,26 @@ inline vector<string> CodeGen::EmitThreadSpawn(Call *c, vector<Node *> &an) {
             // Reserve the packed prefix, construct directly into the
             // packet, then save only the header's count and fixed fields.
             auto pre = FoPrefixSize(pt), pp = T(), h = T();
+            CheckSpace(stk, pre);
             L("uint8_t *", pp, " = ", Top(stk), ";");
-            Bump(stk, pre);
+            L(TopW(stk), " += ", pre, ";");
             L(CT(pt), " ", h, ";");
             GenConstruct(an[1 + i], stk, pt, h);
             L("*", cntp, " = ", FoTailHdr(pt, h), ".len;");
             L("GS_MEMCPY(", pp, ", &", h, ", ", pre, ");");
         } else {
-            GenConstruct(an[1 + i], stk, pt, cat("(*", cntp, ")"));
+            auto cntv = T();
+            L("gs_len_t ", cntv, " = 0;");
+            GenConstruct(an[1 + i], stk, pt, cntv);
+            L("*", cntp, " = ", cntv, ";");
         }
         L("*", szp, " = ", Top(stk), " - (uint8_t *)(", szp, " + 1);");
     }
     for (auto d : ThreadGlobals(sp)) {
+        CheckSpace(stk, "8");
         auto szp = T();
         L("gs_i64 *", szp, " = (gs_i64 *)", Top(stk), ";");
-        Bump(stk, "8");
+        L(TopW(stk), " += 8;");
         auto lv = VarLoc(d);
         if (IsResz(d->type)) {
             EmitRzImage(lv, d->type, stk, c->line);
@@ -1169,18 +1189,21 @@ inline vector<string> CodeGen::EmitThreadSpawn(Call *c, vector<Node *> &an) {
                 auto &p = gpools[d];
                 auto flsz = FlEntrySize(d);
                 EmitValStore(stk, ast.inttypes[IS_I64], cat(p.first, ".len"));
+                CheckSpace(stk, cat(p.first, ".len * ", flsz));
                 L("GS_MEMCPY(", Top(stk), ", ", p.first, ".base, (size_t)(", p.first,
                   ".len * ", flsz, "));");
-                Bump(stk, cat(p.first, ".len * ", flsz));
+                L(TopW(stk), " += ", p.first, ".len * ", flsz, ";");
             }
         } else if (IsBytesT(d->type)) {
             auto n = T();
             L("int64_t ", n, " = ", SizeX(d->type, lv.s), ";");
+            CheckSpace(stk, n);
             L("GS_MEMCPY(", Top(stk), ", ", lv.s, ", (size_t)", n, ");");
-            Bump(stk, n);
+            L(TopW(stk), " += ", n, ";");
         } else {
+            CheckSpace(stk, cat(FixedSize(d->type)));
             L("GS_MEMCPY(", Top(stk), ", &", lv.s, ", ", FixedSize(d->type), ");");
-            Bump(stk, cat(FixedSize(d->type)));
+            L(TopW(stk), " += ", FixedSize(d->type), ";");
         }
         L("*", szp, " = ", Top(stk), " - (uint8_t *)(", szp, " + 1);");
     }
@@ -1379,8 +1402,9 @@ inline void CodeGen::AppendBytes(const Loc &lv, const string &src, const string 
         L(v.lenlv, " = (", LenCast(lv), ")(", ol, " + ", n, ");");
         return;
     }
+    CheckSpace(lv.stk, n);
     L(CopyFn(), "(", Top(lv.stk), ", ", src, ", (size_t)", n, ");");
-    Bump(lv.stk, n);
+    L(TopW(lv.stk), " += ", n, ";");
     L(v.lenlv, " += ", n, ";");
 }
 
@@ -1454,10 +1478,12 @@ inline vector<string> CodeGen::EmitToBytes(vector<Node *> &an, Dst d0, Line ln) 
         return {};
     }
     auto rd = OpenRzDest(GrowU8(), d0, ln, "to_bytes");
+    CheckSpace(rd.stk, pn);
     L("GS_MEMCPY(", Top(rd.stk), ", ", pfx, ", (size_t)", pn, ");");
-    Bump(rd.stk, pn);
+    L(TopW(rd.stk), " += ", pn, ";");
+    CheckSpace(rd.stk, sz);
     L(CopyFn(), "(", Top(rd.stk), ", ", src, ", (size_t)", sz, ");");
-    Bump(rd.stk, sz);
+    L(TopW(rd.stk), " += ", sz, ";");
     auto tot = T();
     L("int64_t ", tot, " = ", pn, " + ", sz, ";");
     CloseRzDest(rd, tot);
@@ -1501,8 +1527,9 @@ inline vector<string> CodeGen::EmitFromBytes(Call *c, vector<Node *> &an, Dst d0
         auto bn = T();
         L("int64_t ", bn, " = (", pn, " + 7) / 8;");
         L("if (", bn, " > GS_BM_MAX) { ", bn, " = 0; ", ok, " = 0; }");
+        CheckSpace(bstk, bn);
         L("GS_MEMZERO(", bm, ", (size_t)", bn, ");");
-        Bump(bstk, bn);
+        L(TopW(bstk), " += ", bn, ";");
     }
     auto cnt = T();
     // The verifier reads index types' array lengths through global headers.
@@ -1516,8 +1543,9 @@ inline vector<string> CodeGen::EmitFromBytes(Call *c, vector<Node *> &an, Dst d0
     auto rd = OpenRzDest(t, d0, ln, "from_bytes");
     L("if (", ok, ") {");
     ind++;
+    CheckSpace(rd.stk, pn);
     L("GS_MEMCPY(", Top(rd.stk), ", ", pay, ", (size_t)", pn, ");");
-    Bump(rd.stk, pn);
+    L(TopW(rd.stk), " += ", pn, ";");
     ind--;
     L("}");
     CloseRzDest(rd, cat("(", ok, " ? ", cnt, " : 0)"));

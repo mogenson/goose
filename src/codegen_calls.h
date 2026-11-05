@@ -328,7 +328,7 @@ inline vector<string> CodeGen::EmitSpecCall(Call *c, FnSpec *sp, Dst d0, vector<
             if (!er.empty()) {
                 ername = er;
                 reprefixcnt = T();
-                L("int64_t ", reprefixcnt, " = 0;");
+                L("gs_len_t ", reprefixcnt, " = 0;");
                 // The run lands behind the destination's prefix: claim
                 // those bytes now and patch the count in afterwards.
                 Bump(dd.s, cat(PrefixBytes(LenStore(dd.t->arr))));

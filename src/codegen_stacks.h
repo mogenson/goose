@@ -65,10 +65,40 @@ inline void CodeGen::BoundStacks() {
             }
         }
         for (auto m : scc) stackneed[m] = need;
+        vector<int64_t> bounds((size_t)need, 0);
+        auto merge = [&](size_t idx, int64_t b) {
+            if (idx >= bounds.size()) bounds.resize(idx + 1, 0);
+            bounds[idx] = (bounds[idx] < 0 || b < 0) ? -1 : std::max(bounds[idx], b);
+        };
+        for (auto m : scc) {
+            if (auto sb = stackslotbounds.find(m); sb != stackslotbounds.end())
+                for (size_t k = 0; k < sb->second.size(); k++) merge(k, sb->second[k]);
+            auto it = stackcalls.find(m);
+            if (it == stackcalls.end()) continue;
+            for (auto &c : it->second) {
+                if (members.count(c.callee)) continue;
+                if (auto cb = stackslotbounds.find(c.callee); cb != stackslotbounds.end())
+                    for (size_t k = 0; k < cb->second.size(); k++)
+                        merge((size_t)c.offset + k, cb->second[k]);
+            }
+        }
+        for (auto m : scc) stackslotbounds[m] = bounds;
     };
     for (auto sp : livespecs)
         if (!index.count(sp)) visit(sp);
     if (!index.count(nullptr)) visit(nullptr);
+    auto roots = MainRoots();
+    roots.push_back(nullptr);
+    int64_t mainstacks = 0;
+    for (auto r : roots) mainstacks = std::max(mainstacks, stackneed[r]);
+    mainstackbounds.assign((size_t)mainstacks, 0);
+    for (auto r : roots) {
+        if (auto sb = stackslotbounds.find(r); sb != stackslotbounds.end())
+            for (size_t k = 0; k < sb->second.size() && k < mainstackbounds.size(); k++)
+                mainstackbounds[k] = (mainstackbounds[k] < 0 || sb->second[k] < 0)
+                                         ? -1
+                                         : std::max(mainstackbounds[k], sb->second[k]);
+    }
 }
 
 // A program's count: over its entry points, and what runs with gs_sp at 0

@@ -37,22 +37,19 @@ static const char *gs_errmsgs[] = {
    instead. */
 static GS_NORETURN void gs_end(int code);
 
-#include <setjmp.h>
 #include <stdarg.h>
+#if GS_NEED_THREADS
+#include <setjmp.h>
 /* No abort is raised in a signal handler, so the jump leaves the signal
-   state alone. */
-#ifdef _WIN32
+   state alone; _setjmp is POSIX's, so a freestanding libc gets the
+   standard form. */
+#if defined(_WIN32) || GS_FREESTANDING
 #define gs_setjmp(b)  setjmp(b)
 #define gs_longjmp    longjmp
 #else
 #define gs_setjmp(b)  _setjmp(b)
 #define gs_longjmp    _longjmp
 #endif
-
-GS_API GS_NORETURN void gs_panic(const char *msg) {
-    fprintf(stderr, "goose runtime error: %s\n", msg);
-    gs_end(1);
-}
 
 /* Where an abort in a contained worker returns to (gs_run_contained), and
    the message it leaves there for thread_wait; NULL on every other thread. */
@@ -62,6 +59,12 @@ typedef struct {
     int64_t len;
 } gs_contained;
 static GS_TLS gs_contained *gs_contain;
+#endif
+
+GS_API GS_NORETURN void gs_panic(const char *msg) {
+    fprintf(stderr, "goose runtime error: %s\n", msg);
+    gs_end(1);
+}
 
 /* The end of a failed check or abort(msg) (§9.3), whose message is `len`
    bytes at `msg` and the location after it. A contained worker's keeps the
@@ -75,7 +78,9 @@ static GS_NORETURN void gs_fail(const void *msg, int64_t len, const char *file, 
     int64_t loc = file ? snprintf(NULL, 0, " (%s:%d)\n", file, line) : 1;
     uint8_t *text = (uint8_t *)malloc((size_t)(pre + len + loc + 1));
     if (!text) {
+#if GS_NEED_THREADS
         if (gs_contain) gs_panic("out of memory recording an aborted thread");
+#endif
         fputs(lead, stderr);
         fwrite(msg, 1, (size_t)len, stderr);
         if (file) fprintf(stderr, " (%s:%d)\n", file, line);
@@ -86,12 +91,14 @@ static GS_NORETURN void gs_fail(const void *msg, int64_t len, const char *file, 
     if (len) memcpy(text + pre, msg, (size_t)len);
     if (file) snprintf((char *)text + pre + len, (size_t)loc + 1, " (%s:%d)\n", file, line);
     else memcpy(text + pre + len, "\n", 2);
+#if GS_NEED_THREADS
     if (gs_contain) {
         memmove(text, text + pre, (size_t)(len + loc - 1));
         gs_contain->msg = text;
         gs_contain->len = len + loc - 1;
         gs_longjmp(gs_contain->jump, 1);
     }
+#endif
     fwrite(text, 1, (size_t)(pre + len + loc), stderr);
     free(text);
     gs_end(1);
@@ -197,23 +204,30 @@ static uint64_t gs_stack_budget;
 static int64_t gs_mainregions, gs_workerregions;
 static int64_t gs_thread_cap = INT64_MAX;
 
-/* A region's own sizes travel with it: those reserved before a refusal
-   halved the size are larger than those after. */
-typedef struct {
-    uint8_t *base;
-    size_t usable, size;    /* size: with the guard gap */
-    gs_stack *stack;       /* Stable descriptor of the owning data stack. */
-    /* Windows: one past the highest page the fault handler has
-       committed, so gs_trim_memory releases only what was ever committed
-       rather than walking the whole reservation. Unused on POSIX, where
-       the kernel supplies pages on touch. */
-    uint8_t *committed;
-} gs_region;
 static GS_TLS gs_region *gs_regions;
 static GS_TLS volatile long gs_nregions;
 /* The registry's size: the thread program's region count, as the compiler
    worked it out, so a reservation past it is a compiler bug. */
 static GS_TLS long gs_regions_cap;
+
+#if GS_STATIC_STACKS
+static uint8_t *gs_static_arena;
+static size_t gs_static_size, gs_static_offset;
+static const size_t *gs_static_sizes;
+static gs_region *gs_static_regions;
+static int64_t gs_static_count;
+
+static void gs_static_stacks_setup(uint8_t *arena, size_t size, const size_t *sizes,
+                                   gs_stack *stks, gs_region *regions, int64_t count) {
+    gs_static_arena = arena;
+    gs_static_size = size;
+    gs_static_offset = 0;
+    gs_static_sizes = sizes;
+    gs_static_stks = stks;
+    gs_static_regions = regions;
+    gs_static_count = count;
+}
+#endif
 
 /* Text without stdio, which a fault handler may not call (nor malloc):
    decimal digits, a size in the largest unit that holds it exactly, and a
@@ -260,13 +274,18 @@ static size_t gs_overflow_text(char *buf, const gs_region *r) {
     p = gs_text(p, " data stacks grew past the ");
     p = gs_size(p, r->usable);
     p = gs_text(p, " reserved for it");
-    if (r->usable < gs_region_reserve) {
+    if (!GS_STATIC_STACKS && r->usable < gs_region_reserve) {
         p = gs_text(p, " (halved from ");
         p = gs_size(p, gs_region_reserve);
         p = gs_text(p, " when the platform ran out of address space)");
     }
+#if GS_STATIC_STACKS
+    p = gs_text(p, "; --stack-reserve or -DGS_STACK_RESERVE raises a dynamic stack's size, "
+                   "up to 2 GB\n");
+#else
     p = gs_text(p, "; --stack-reserve or -DGS_STACK_RESERVE raises the reservation, "
                    "up to 256 TB\n");
+#endif
     return (size_t)(p - buf);
 }
 
@@ -285,6 +304,14 @@ GS_API GS_NORETURN void gs_stack_overflow(const void *at) {
 /* The calling thread program's registry, empty, as it starts. */
 static void gs_regions_begin(int64_t capacity) {
     gs_regions_cap = (long)capacity;
+#if GS_STATIC_STACKS
+    if (gs_current_thread_id < 0 && gs_static_regions) {
+        gs_regions = gs_static_regions;
+        memset(gs_regions, 0, (size_t)(capacity > 0 ? capacity : 1) * sizeof(gs_region));
+        gs_nregions = 0;
+        return;
+    }
+#endif
     gs_regions = (gs_region *)calloc((size_t)(capacity > 0 ? capacity : 1), sizeof(gs_region));
     if (!gs_regions) gs_panic("out of memory allocating the data stack registry");
     gs_nregions = 0;
@@ -302,12 +329,48 @@ GS_API void gs_release_regions(void) {
         gs_regions[i].base = NULL;
         gs_release_region(&r);
     }
-    free(gs_regions);
+#if GS_STATIC_STACKS
+    if (gs_regions != gs_static_regions)
+#endif
+        free(gs_regions);
     gs_regions = NULL;
     gs_native_stack_free();
 }
 
-#ifdef _WIN32
+#if GS_STATIC_STACKS
+
+static size_t gs_os_page_size(void) { return 64; }
+static void gs_regions_init(void) {}
+static void gs_native_stack_init(void) {}
+static void gs_native_stack_free(void) {}
+static void gs_fault_uninstall(void) {}
+
+static void gs_release_region(const gs_region *r) {
+    if (gs_current_thread_id >= 0 || !gs_static_arena)
+        free(r->base);
+}
+
+/* Whether this is the first call of gs_end; and where the later ones wait.
+   A thread program alone counts plainly; TinyCC names the memory orders in
+   its stdatomic.h alone. */
+#if GS_NEED_THREADS
+#ifndef __ATOMIC_SEQ_CST
+#define __ATOMIC_SEQ_CST 5
+#endif
+#endif
+static int gs_end_first(void) {
+    static int ended;
+#if GS_NEED_THREADS
+    return !__atomic_fetch_add(&ended, 1, __ATOMIC_SEQ_CST);
+#else
+    return !ended++;
+#endif
+}
+static GS_NORETURN void gs_park(void) {
+    for (;;) {}
+}
+
+#elif defined(_WIN32)
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -621,7 +684,7 @@ static GS_NORETURN void gs_end(int code) {
 #else
     if (!gs_end_first()) gs_park();
     fflush(NULL);
-    #ifdef __TINYC__
+    #if defined(__TINYC__) && !GS_STATIC_STACKS
         if (gs_current_thread_id < 0) exit(code);
     #endif
     _Exit(code);
@@ -642,6 +705,35 @@ static GS_NORETURN void gs_end(int code) {
 GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
     if (gs_nregions >= gs_regions_cap)
         gs_panic("too many data stack regions");
+    long i = gs_nregions;
+#if GS_STATIC_STACKS
+    /* Main's regions are carved from the program's arena, each the size
+       the compiler set it (gs_static_stacks_setup); a worker's come from
+       the heap at the dynamic size. The arena holds exactly the regions
+       the compiler counted, so running past either count or its end is a
+       compiler bug, not a condition to grow out of. */
+    size_t usable = gs_region_usable;
+    uint8_t *p;
+    if (gs_current_thread_id < 0 && gs_static_arena) {
+        if (i >= gs_static_count) gs_panic("more main data stack regions than the static arena holds");
+        usable = gs_static_sizes[i];
+        if (usable > gs_static_size - gs_static_offset)
+            gs_panic("the static data stack arena is smaller than its regions");
+        p = gs_static_arena + gs_static_offset;
+        gs_static_offset += usable;
+    } else {
+        p = (uint8_t *)malloc(usable ? usable : 1);
+        if (!p) gs_panic("cannot allocate data stack region");
+    }
+    stack->limit = p + usable;
+    gs_regions[i].base = p;
+    gs_regions[i].usable = usable;
+    gs_regions[i].size = usable;
+    gs_regions[i].stack = stack;
+    gs_regions[i].committed = p + usable;
+    gs_nregions = i + 1;
+    return p;
+#else
     size_t usable = gs_region_usable;
     uint8_t *p;
     for (;;) {
@@ -652,7 +744,6 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
         usable -= usable % gs_region_page;
         gs_region_usable = usable;
     }
-    long i = gs_nregions;
     gs_regions[i].base = p;
     gs_regions[i].usable = usable;
     gs_regions[i].size = usable + gs_region_gap;
@@ -660,6 +751,7 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
     gs_regions[i].committed = p;
     gs_nregions = i + 1;  /* Publish only the initialized entry. */
     return p;
+#endif
 }
 
 /* Explicit rather than on every rewind: short-lived scratch can reuse its
@@ -683,6 +775,15 @@ GS_API uint8_t *gs_reserve_region(gs_stack *stack) {
    from Goose through another extern must not: tops cached by the Goose
    frames above it would still be stale, and live pages above them lost. */
 GS_API uint8_t gs_trim_memory(void) {
+#if GS_STATIC_STACKS
+    for (long i = 0; i < gs_nregions; i++) {
+        gs_region *r = &gs_regions[i];
+        uintptr_t base = (uintptr_t)r->base, top = (uintptr_t)r->stack->top;
+        if (top < base || top - base > r->usable)
+            gs_panic("data stack top outside its region in trim_memory");
+    }
+    return 1;
+#else
     uintptr_t page = (uintptr_t)gs_page_size;
     int ok = 1;
     for (long i = 0; i < gs_nregions; i++) {
@@ -718,6 +819,7 @@ GS_API uint8_t gs_trim_memory(void) {
 #endif
     }
     return (uint8_t)ok;
+#endif
 }
 
 /* ---------------------------------------------------------------------------
@@ -752,7 +854,7 @@ typedef struct { int64_t root, height, chain; } gs_sphead;
    the leaf's last. */
 typedef struct {
     uint8_t *base;
-    int64_t *n;
+    gs_len_t *n;
     uint8_t **top;
     int64_t h, node[GS_SPAN_DEPTH], pos[GS_SPAN_DEPTH];
 } gs_sppath;
@@ -767,6 +869,7 @@ static int64_t gs_sp_newnode(gs_sppath *p) {
         GS_SPHEAD(p)->chain = GS_SPLEAF(p, i)->link;
         return i;
     }
+    gs_check_space((gs_stack *)p->top, GS_SPAN_NODE);
     *p->top += GS_SPAN_NODE;
     return (*p->n)++;
 }
@@ -1019,7 +1122,7 @@ static void gs_sp_take(gs_sppath *p, int64_t k, int64_t cnt) {
    caller grows the array to the returned index plus cnt. First fit rather
    than best: in index order it packs runs toward the start and leaves the
    end free. */
-GS_API int64_t gs_spans_alloc(uint8_t *base, int64_t *n, uint8_t **top, int64_t len,
+GS_API int64_t gs_spans_alloc(uint8_t *base, gs_len_t *n, uint8_t **top, int64_t len,
                               int64_t cnt) {
     gs_sppath p;
     int64_t l, i, k = 0, j, m, c, now, idx, before[GS_SPAN_DEPTH];
@@ -1173,7 +1276,7 @@ static void gs_sp_release(gs_sppath *p, gs_spnear *s, int64_t idx, int64_t cnt) 
 }
 
 /* Merged with the spans it touches. */
-GS_API void gs_spans_free(uint8_t *base, int64_t *n, uint8_t **top, int64_t idx, int64_t cnt) {
+GS_API void gs_spans_free(uint8_t *base, gs_len_t *n, uint8_t **top, int64_t idx, int64_t cnt) {
     gs_sppath p, q;
     gs_spnear s;
     if (cnt <= 0) return;
@@ -1182,6 +1285,7 @@ GS_API void gs_spans_free(uint8_t *base, int64_t *n, uint8_t **top, int64_t idx,
     p.top = top;
     if (*n == 0) {
         gs_sphead *hd = (gs_sphead *)base;
+        gs_check_space((gs_stack *)top, GS_SPAN_NODE);
         *n = 1;
         *top = base + GS_SPAN_NODE;
         hd->chain = 0;
@@ -1199,7 +1303,7 @@ GS_API void gs_spans_free(uint8_t *base, int64_t *n, uint8_t **top, int64_t idx,
    places one of cnt elements. The span after the slice is the one after
    the last span before it, so one descent finds both what growth takes
    from and what the elements merge with. */
-GS_API int64_t gs_spans_regrow(uint8_t *base, int64_t *n, uint8_t **top, int64_t len,
+GS_API int64_t gs_spans_regrow(uint8_t *base, gs_len_t *n, uint8_t **top, int64_t len,
                                int64_t idx, int64_t ol, int64_t cnt) {
     gs_sppath p, q;
     gs_spnear s;
@@ -1552,7 +1656,7 @@ static const char gs_digit_pairs[201] =
     "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
     "8081828384858687888990919293949596979899";
 
-static int gs_fmt_digits(uint64_t v) {
+static int gs_fmt_digits32(uint32_t v) {
     int n = 1;
     for (;;) {
         if (v < 10) return n;
@@ -1564,21 +1668,38 @@ static int gs_fmt_digits(uint64_t v) {
     }
 }
 
+static int gs_fmt_digits(uint64_t v) {
+    int n = 0;
+    while (v > UINT32_MAX) {
+        v /= 10000;
+        n += 4;
+    }
+    return n + gs_fmt_digits32((uint32_t)v);
+}
+
 GS_API int64_t gs_fmt_u64(uint8_t *dst, uint64_t v) {
     int n = gs_fmt_digits(v);
     uint8_t *p = dst + n;
-    while (v >= 100) {
+    while (v > UINT32_MAX) {
         unsigned r = (unsigned)(v % 100);
         v /= 100;
         p -= 2;
         p[0] = (uint8_t)gs_digit_pairs[2 * r];
         p[1] = (uint8_t)gs_digit_pairs[2 * r + 1];
     }
-    if (v >= 10) {
-        p[-2] = (uint8_t)gs_digit_pairs[2 * v];
-        p[-1] = (uint8_t)gs_digit_pairs[2 * v + 1];
+    uint32_t v32 = (uint32_t)v;
+    while (v32 >= 100) {
+        unsigned r = (unsigned)(v32 % 100);
+        v32 /= 100;
+        p -= 2;
+        p[0] = (uint8_t)gs_digit_pairs[2 * r];
+        p[1] = (uint8_t)gs_digit_pairs[2 * r + 1];
+    }
+    if (v32 >= 10) {
+        p[-2] = (uint8_t)gs_digit_pairs[2 * v32];
+        p[-1] = (uint8_t)gs_digit_pairs[2 * v32 + 1];
     } else {
-        p[-1] = (uint8_t)('0' + v);
+        p[-1] = (uint8_t)('0' + v32);
     }
     return n;
 }

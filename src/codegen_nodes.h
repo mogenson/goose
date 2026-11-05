@@ -858,7 +858,7 @@ inline void Assign::CgStmt(CodeGen &cg) {
         lv.s = p;
     } else if (lv.viaref && !lv.lenlv.empty()) {
         auto p = cg.T();
-        cg.L("gs_i64 *", p, " = &(", lv.lenlv, ");");
+        cg.L("gs_ulen_t *", p, " = &(", lv.lenlv, ");");
         lv.lenlv = cat("(*", p, ")");
     }
     if (lv.viaref && cg.IsResz(lv.t) && !lv.stk.empty() && !cg.CacheableStk(lv.stk)) {

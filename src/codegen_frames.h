@@ -382,7 +382,7 @@ inline void CodeGen::CollectSpecs() {
             if (auto al = Is<ArrayLit>(n); al && al->exprtype->kind == TY_SLICE &&
                 IsFix(al->exprtype->sub)) {
                 auto count = LitCount(al);
-                si.needssp |= count > NATIVE_VALUE_LIMIT /
+                si.needssp |= count > NativeValueLimit() /
                     std::max<int64_t>(FixedSize(al->exprtype->sub), 1);
             }
             // A payload bound by value is copied onto a stack of its own.
@@ -487,7 +487,7 @@ inline vector<pair<string, string>> CodeGen::ParamFields(TypeExpr *t, bool pool)
         return { { "gs_rhdr *", "hdr" }, { "gs_stack *", "stk" }, { "gs_rhdr *", "fl" },
                  { "gs_stack *", "flstk" } };
     if (IsFatRef(t)) return { { "gs_rhdr *", "hdr" }, { "gs_stack *", "stk" } };
-    if (t->kind == TY_SLICE) return { { "void *", "data" }, { "int64_t ", "len" } };
+    if (t->kind == TY_SLICE) return { { "void *", "data" }, { "gs_len_t ", "len" } };
     return {};
 }
 
@@ -613,7 +613,7 @@ inline string CodeGen::SigParams(FnSpec *sp, bool decls, bool er) {
             if (IsResz(sp->rets[i]) && IsFrameObj(sp->rets[i]))
                 add(cat(CT(sp->rets[i]), " *gs_rl", i));
             else
-                add(cat("gs_i64 *gs_rl", i));
+                add(cat("gs_ulen_t *gs_rl", i));
         } else if (IsBytesT(sp->rets[i])) {
             add(cat("gs_stack *gs_dst", i));
         } else if ((int)i != si.cret) {
@@ -1096,9 +1096,16 @@ inline void CodeGen::EmitExitRestores(int to) {
 // included, which a recursive cycle's scratch locals rely on (§7.8).
 // Returns the stack expression; the caller emits `uint8_t *base = X->top;`
 // and registers it via SaveBase.
-inline string CodeGen::AllocStk(bool forlocal) {
+inline string CodeGen::AllocStk(bool forlocal, int64_t bound) {
     auto k = stknext++;
     stkmax = std::max(stkmax, stknext);
+    if ((int)curslotbounds.size() <= k) {
+        curslotbounds.resize(k + 1, bound);
+    } else if (curslotbounds[k] < 0 || bound < 0) {
+        curslotbounds[k] = -1;
+    } else {
+        curslotbounds[k] = std::max(curslotbounds[k], bound);
+    }
     if (forlocal)
         for (auto i = (int)cscopes.size() - 1; i >= 0 && cscopes[i].kind == SC_STMT; i--)
             cscopes[i].stkbase = std::max(cscopes[i].stkbase, stknext);

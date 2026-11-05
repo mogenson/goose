@@ -13,8 +13,9 @@ namespace goose {
 inline void CodeGen::EmitValStore(const string &stk, TypeExpr *t, const string &x) {
     auto sz = FixedSize(t);
     if (sz == 0) { L("(void)(", x, ");"); return; }
+    CheckSpace(stk, cat(sz));
     StoreWhole(Top(stk), t, x);
-    Bump(stk, cat(sz));
+    L(TopW(stk), " += ", sz, ";");
 }
 
 // Stores the fixed value x of type t at the byte address p. An aggregate of
@@ -59,10 +60,13 @@ inline void CodeGen::EmitLenCheck(IntStorage ls, const string &n) {
 inline void CodeGen::EmitLenStore(const string &stk, IntStorage ls, const string &n) {
     EmitLenCheck(ls, n);
     if (ls == IS_VARINT) {
-        Bump(stk, cat("gs_uleb_write(", Top(stk), ", (uint64_t)(", n, "))"));
+        CheckSpace(stk, "10");
+        auto top = Top(stk);
+        L(TopW(stk), " += gs_uleb_write(", top, ", (uint64_t)(", n, "));");
     } else {
+        CheckSpace(stk, cat(IntSize(ls)));
         L("*(", IntCT(ls), " *)", Top(stk), " = (", IntCT(ls), ")(", n, ");");
-        Bump(stk, cat(IntSize(ls)));
+        L(TopW(stk), " += ", IntSize(ls), ";");
     }
 }
 
@@ -82,9 +86,10 @@ inline void CodeGen::EmitArrayCount(const string &stk, TypeExpr *at, const strin
         case A_LIMITED: {   // Runtime capacity: chosen as the initial length (v1).
             if (check) EmitLenCheck(IS_U32, n);
             auto x = check ? cat("(uint32_t)", n) : n;
+            CheckSpace(stk, "8");
             L("*(gs_u32 *)", Top(stk), " = ", x, ";");
             L("*(gs_u32 *)(", Top(stk), " + 4) = ", x, ";");
-            Bump(stk, "8");
+            L(TopW(stk), " += 8;");
             break;
         }
         default:
@@ -96,7 +101,9 @@ inline void CodeGen::EmitArrayCount(const string &stk, TypeExpr *at, const strin
 
 // A varint field or element (§3.6): the i64 value `x`, zigzag-encoded.
 inline void CodeGen::EmitVarintStore(const string &stk, const string &x) {
-    Bump(stk, cat("gs_zig_write(", Top(stk), ", ", x, ")"));
+    CheckSpace(stk, "10");
+    auto top = Top(stk);
+    L(TopW(stk), " += gs_zig_write(", top, ", ", x, ");");
 }
 
 // The range check a store of `off` into a relative slot of width `w`
@@ -122,6 +129,9 @@ inline void CodeGen::EmitRelRangeCheck(TypeExpr *rt, const string &off, Line ln,
         L("#endif");
         return;
     }
+    // The offset is signed, so the width spares the check only where a
+    // root spans at most half the width's range: 2 GB for u32, 32 KB for
+    // u16 (§3.9), whatever the target.
     auto guarded = inroot && relrootmax <= (1ll << (bits - 1));
     if (guarded) L("#if GS_STACK_RESERVE > (1ull << ", bits - 1, ")");
     L("if (", off, " < -(1LL << ", bits - 1, ") || ", off, " >= (1LL << ",
@@ -198,16 +208,17 @@ inline void CodeGen::EmitRelStoreAt(const string &fa, TypeExpr *rt, const string
 inline void CodeGen::EmitRelStore(const string &stk, TypeExpr *rt, const string &rv, Line ln,
                                   RelFacts f) {
     auto w = (IntStorage)rt->ref->lenstorage;
+    CheckSpace(stk, w == IS_VARINT ? "10" : cat(IntSize(w)));
     auto fa = T();
     L("uint8_t *", fa, " = ", Top(stk), ";");
     if (w == IS_VARINT) {
         assert(!IsResz(rt->ref->sub));
         auto off = RelOffset(rt, RelOrigin(rt, fa), rv, ln, f);
-        Bump(stk, rt->ref->pool ? cat("gs_uleb_write(", fa, ", (uint64_t)", off, ")")
-                                : cat("gs_zig_write(", fa, ", ", off, ")"));
+        L(TopW(stk), " += ", rt->ref->pool ? cat("gs_uleb_write(", fa, ", (uint64_t)", off, ");")
+                                           : cat("gs_zig_write(", fa, ", ", off, ");"));
     } else {
         EmitRelStoreAt(fa, rt, rv, ln, true, f);
-        Bump(stk, cat(IntSize(w)));
+        L(TopW(stk), " += ", IntSize(w), ";");
     }
 }
 
@@ -242,8 +253,10 @@ inline void CodeGen::EmitRelSelfAt(const string &fa, TypeExpr *rt, int64_t field
 }
 
 inline void CodeGen::EmitRelSelfStore(const string &stk, TypeExpr *rt, int64_t fieldoff, Line ln) {
+    auto sz = IntSize((IntStorage)rt->ref->lenstorage);
+    CheckSpace(stk, cat(sz));
     EmitRelSelfAt(Top(stk), rt, fieldoff, ln);
-    Bump(stk, cat(IntSize((IntStorage)rt->ref->lenstorage)));
+    L(TopW(stk), " += ", sz, ";");
 }
 
 // Whether a fixed value of type t can hold bytes nothing ever wrote: the
@@ -336,8 +349,9 @@ inline void CodeGen::EmitCopyElems(const string &stk, TypeExpr *elem, const stri
                                    const string &n) {
     if (IsFix(elem)) {
         auto esz = FixedSize(elem);
+        CheckSpace(stk, cat("(", n, ") * ", esz));
         L(CopyFn(), "(", Top(stk), ", ", src, ", (size_t)((", n, ") * ", esz, "));");
-        Bump(stk, cat("(", n, ") * ", esz));
+        L(TopW(stk), " += (", n, ") * ", esz, ";");
     } else {
         auto p = T(), iv = T();
         L("const uint8_t *", p, " = (const uint8_t *)(", src, ");");
@@ -345,8 +359,9 @@ inline void CodeGen::EmitCopyElems(const string &stk, TypeExpr *elem, const stri
         ind++;
         auto sz = T();
         L("int64_t ", sz, " = ", SizeX(elem, p), ";");
+        CheckSpace(stk, sz);
         L("GS_MEMCPY(", Top(stk), ", ", p, ", (size_t)", sz, ");");
-        Bump(stk, sz);
+        L(TopW(stk), " += ", sz, ";");
         L(p, " += ", sz, ";");
         ind--;
         L("}");
@@ -494,11 +509,13 @@ inline void CodeGen::GenConstruct(Node *n, const string &stk, TypeExpr *want, co
         // The zero value of an optional field.
         assert(et->kind == TY_REF);
         if (et->ref->lenstorage == IS_VARINT) {
+            CheckSpace(stk, "1");
             L("*", Top(stk), " = 0;");
-            Bump(stk, "1");
+            L(TopW(stk), " += 1;");
         } else {
+            CheckSpace(stk, cat(FixedSize(et)));
             L("GS_MEMZERO(", Top(stk), ", ", FixedSize(et), ");");
-            Bump(stk, cat(FixedSize(et)));
+            L(TopW(stk), " += ", FixedSize(et), ";");
         }
         return;
     }
@@ -507,8 +524,9 @@ inline void CodeGen::GenConstruct(Node *n, const string &stk, TypeExpr *want, co
         assert(et->kind == TY_ARRAY);
         EmitArrayCount(stk, et, lenlv, cat(s->val.size()), false);
         if (!s->val.empty()) {
+            CheckSpace(stk, cat(s->val.size()));
             L("GS_MEMCPY(", Top(stk), ", ", StrRaw(s->val), ", ", s->val.size(), ");");
-            Bump(stk, cat(s->val.size()));
+            L(TopW(stk), " += ", s->val.size(), ";");
         }
         return;
     }
@@ -585,8 +603,9 @@ inline void CodeGen::ConstructFromLoc(Loc lv, TypeExpr *et, const string &stk,
         assert(!lv.val);
         auto sz = T();
         L("int64_t ", sz, " = ", SizeX(et, lv.s), ";");
+        CheckSpace(stk, sz);
         L("GS_MEMCPY(", Top(stk), ", ", lv.s, ", (size_t)", sz, ");");
-        Bump(stk, sz);
+        L(TopW(stk), " += ", sz, ";");
         return;
     }
     if (et->kind == TY_ARRAY) { GenArrayFromLoc(lv, et, stk, ln, lenlv); return; }
@@ -813,8 +832,9 @@ inline void CodeGen::EmitRzCopy(Loc lv, TypeExpr *et, const string &stk, const s
     auto len = T();
     L("int64_t ", len, " = ", lv.lenlv, ";");
     if (prefix) {
+        CheckSpace(stk, cat(prefix));
         L("GS_MEMCPY(", Top(stk), ", ", lv.s, ", ", prefix, ");");
-        Bump(stk, cat(prefix));
+        L(TopW(stk), " += ", prefix, ";");
     }
     EmitCopyElems(stk, elem, cat("(", lv.s, ") + ", prefix), len);
     L(lenlv, " = ", len, ";");
@@ -924,8 +944,9 @@ inline void CodeGen::GenVarEnumFromLoc(Loc lv, TypeExpr *et, const string &stk) 
         if (!lv.val) {
             auto sz = T();
             L("int64_t ", sz, " = ", SizeX(lv.t, lv.s), ";");
+            CheckSpace(stk, sz);
             L("GS_MEMCPY(", Top(stk), ", ", lv.s, ", (size_t)", sz, ");");
-            Bump(stk, sz);
+            L(TopW(stk), " += ", sz, ";");
         } else {
             EmitValStore(stk, lv.t, lv.s);
         }
@@ -941,9 +962,10 @@ inline void CodeGen::GenVarEnumFromLoc(Loc lv, TypeExpr *et, const string &stk) 
         L("case ", TagConst(ei, (int)vi), ":");
         ind++;
         if (psz) {
+            CheckSpace(stk, cat(psz));
             L("GS_MEMCPY(", Top(stk), ", &", sv, ".u.v_",
               Sanitize(ei->en->variants[vi].name), ", ", psz, ");");
-            Bump(stk, cat(psz));
+            L(TopW(stk), " += ", psz, ";");
         }
         L("break;");
         ind--;
@@ -1004,8 +1026,9 @@ inline void CodeGen::FixedLitAtStk(Node *n, const string &stk) {
     auto et = n->exprtype;
     auto Gap = [&](int64_t bytes) {
         if (bytes <= 0) return;
+        CheckSpace(stk, cat(bytes));
         L("GS_MEMZERO(", Top(stk), ", ", bytes, ");");
-        Bump(stk, cat(bytes));
+        L(TopW(stk), " += ", bytes, ";");
     };
     // `fieldoff` is the field's byte offset within the value, which is
     // what a `self` initializer stores the negation of.
@@ -1215,8 +1238,9 @@ inline void CodeGen::StructLitAt(StructLit *sl, const string &base, bool inroot)
 }
 
 inline void CodeGen::EmitValStoreTag(const string &stk, IntStorage ts, const string &x) {
+    CheckSpace(stk, cat(IntSize(ts)));
     L("*(", IntCT(ts), " *)", Top(stk), " = (", IntCT(ts), ")(", x, ");");
-    Bump(stk, cat(IntSize(ts)));
+    L(TopW(stk), " += ", IntSize(ts), ";");
 }
 
 // The literal built as `as` where that is given (GenConstruct's retarget),
@@ -1235,9 +1259,14 @@ inline void CodeGen::GenArrayLit(ArrayLit *al, const string &stk, const string &
         L("int64_t ", t, " = ", cv, ";");
         L("if (", t, " < 0 || ", t, " > (int64_t)UINT32_MAX) "
           "gs_abort(GS_E_CAPRANGE, ", LocArgs(al->line), ");");
+        auto esz = FixedSize(elem);
+        if (m32 && esz > 0)
+            L("if ((uint64_t)", t, " > (GS_STACK_RESERVE - 8) / ", esz,
+              ") gs_stack_overflow(", Top(stk), ");");
+        CheckSpace(stk, cat("8 + ", t, " * ", esz));
         L("*(gs_u32 *)", Top(stk), " = (uint32_t)", t, ";");
         L("*(gs_u32 *)(", Top(stk), " + 4) = 0;");
-        Bump(stk, cat("8 + ", t, " * ", FixedSize(elem)));
+        L(TopW(stk), " += 8 + ", t, " * ", esz, ";");
         return;
     }
     auto count = LitCount(al);
@@ -1368,7 +1397,7 @@ inline void CodeGen::GenFieldInits(StructLit *sl, const vector<Field> &fields,
     for (size_t i = 0; i < fields.size(); i++) {
         if (fields[i].ispad) {
             auto n = fields[i].padsize > 0 ? fields[i].padsize : 0;
-            if (n) { L("GS_MEMZERO(", Top(stk), ", ", n, ");"); Bump(stk, cat(n)); }
+            if (n) { CheckSpace(stk, cat(n)); L("GS_MEMZERO(", Top(stk), ", ", n, ");"); L(TopW(stk), " += ", n, ";"); }
             continue;
         }
         auto init = sl->InitFor((int)i);
@@ -1376,9 +1405,10 @@ inline void CodeGen::GenFieldInits(StructLit *sl, const vector<Field> &fields,
         if (IsRelRef(ft)) {
             // Relative-reference slot: store from the plain reference.
             if (!init) {
-                if (ft->ref->lenstorage == IS_VARINT) { L("*", Top(stk), " = 0;"); Bump(stk, "1"); }
-                else { L("GS_MEMZERO(", Top(stk), ", ", IntSize((IntStorage)ft->ref->lenstorage), ");");
-                       Bump(stk, cat(IntSize((IntStorage)ft->ref->lenstorage))); }
+                if (ft->ref->lenstorage == IS_VARINT) { CheckSpace(stk, "1"); L("*", Top(stk), " = 0;"); L(TopW(stk), " += 1;"); }
+                else { CheckSpace(stk, cat(IntSize((IntStorage)ft->ref->lenstorage)));
+                       L("GS_MEMZERO(", Top(stk), ", ", IntSize((IntStorage)ft->ref->lenstorage), ");");
+                       L(TopW(stk), " += ", IntSize((IntStorage)ft->ref->lenstorage), ";"); }
                 continue;
             }
             // A `self` field points at the value this literal is building,
@@ -1390,8 +1420,9 @@ inline void CodeGen::GenFieldInits(StructLit *sl, const vector<Field> &fields,
         if (!init) {
             // Omitted optional: null (checked by TC that a default exists otherwise).
             assert(ft->kind == TY_REF && ft->ref->optional);
+            CheckSpace(stk, cat(FixedSize(ft)));
             L("GS_MEMZERO(", Top(stk), ", ", FixedSize(ft), ");");
-            Bump(stk, cat(FixedSize(ft)));
+            L(TopW(stk), " += ", FixedSize(ft), ";");
             continue;
         }
         // The resizable tail (if any) receives the enclosing header's

@@ -191,7 +191,7 @@ These options have the same meaning for `goose run`, `goose build`,
 | `-O0`, `-O1`, `-O2` | How much the Goose compiler inlines: nothing, a little, or the most (the default). Constant folding and propagation run at every level, and a build's C compiler optimizes at every level. |
 | `--debug` | Turn on the overflow checks, the range checks of `as` casts and the tag checks (`GS_DEBUG=1`). Each failure names its source line, and an overflow or a cast names the values involved. A build also gets debug information ([§3](#3-building-an-executable)). |
 | `-D NAME[=VALUE]` | Define a C macro in the generated program, as `-DNAME[=VALUE]` does too. The define is written into the C itself, so a run and a build see the same source. The value is 1 when none is given. |
-| `--stack-reserve size` | The address space reserved for each data stack, from 64K up to 256T with a `K`, `M`, `G` or `T` suffix. The default is 2G. The address space is committed as it is used, so a large reservation costs nothing until it is used. |
+| `--stack-reserve size` | The address space reserved for each data stack, from 64K up to 256T with a `K`, `M`, `G` or `T` suffix. The default is 2G. The address space is committed as it is used, so a large reservation costs nothing until it is used. Under `--m32` it is the size of each data stack that grows, from 64 bytes up to 2G, and the default is 64K ([§8](#8-writing-the-c-yourself)). |
 | `--stacks` | Report how many data stacks the program and each of its workers use, what that adds up to, and the cap it puts on `hardware_threads()`. |
 | `--bce-lines` | Report, for each source line, how many bounds checks the compiler removed and how many it kept. |
 | `--no-bce` | Keep every bounds check. `checkfree` functions are then not verified, and the compiler warns about that. |
@@ -211,11 +211,13 @@ The `-D` macros that the runtime reads, which configure a program:
 |---|---|---|
 | `GS_DEBUG` | 0 | 1 is what `--debug` sets: the overflow, range and tag checks. |
 | `GS_STACK_STATS` | 0 | 1 makes each thread program report its data stack use on stderr as it ends. |
-| `GS_STACK_RESERVE` | 2 GB | The address space reserved per data stack, which `--stack-reserve` sets. |
-| `GS_STACK_GAP` | 1 MB | The unmapped gap after each data stack, which makes runaway growth abort. |
-| `GS_STACK_BUDGET` | 32 TB | The address space all thread programs together are meant to take; `hardware_threads()` is capped at what it has room for. |
+| `GS_STACK_RESERVE` | 2 GB | The address space reserved per data stack, which `--stack-reserve` sets. Under `--m32`, the size of each data stack that grows; 64 KB. |
+| `GS_STACK_GAP` | 1 MB | The unmapped gap after each data stack, which makes runaway growth abort. Under `--m32`, 0: the stacks are checked in software. |
+| `GS_STACK_BUDGET` | 32 TB | The address space all thread programs together are meant to take; `hardware_threads()` is capped at what it has room for. Under `--m32`, 16 MB. |
 | `GS_MAX_STACKS` | 1024 | The most data stacks one thread program may use. A program that needs more fails to compile. |
 | `GS_SIMD` | 2 | The highest CPU level for `simd` functions' versions under clang on x86-64: 0 or 1 lowers it. |
+| `GS_FREESTANDING` | 0 (1 under `--m32`) | 1 builds for a libc without an operating system's layer: no `dlopen`, threads, `stdio` locking or directory listing, and 256-byte path buffers. |
+| `GS_MAIN` | `main` | The name of the program's entry point, for a host (an RTOS) that has a `main` of its own and calls the program from it. |
 
 A program that runs out of a data stack ends with a message that names
 `--stack-reserve`. `--stacks` and `-DGS_STACK_STATS=1` show how many stacks
@@ -321,6 +323,7 @@ against it (`goose version` prints the runtime's hash, which must match).
 |---|---|
 | `-o out.c` | Write the program's C, and do not run it. |
 | `--standalone` | Write C that holds the whole runtime, and builds on its own: `cc -O2 tour.c -o tour -lm -pthread`. |
+| `--m32` | Write C for a 32-bit target: references of 4 bytes, slices and resizable headers of 8, and the data stacks in a static arena checked in software rather than in reserved address space, for a microcontroller or wasm32 (experimental; see the [README](../README.md#experimental-32-bit--embeddedwasm-support---m32)). Takes `-o` (or `check`), implies `--standalone`, and sizes each data stack that grows by `--stack-reserve`, 64K unless given. The C defines `GS_FREESTANDING` as 1, which leaves out what needs an operating system (`dlopen`, threads, directory listing); `-DGS_FREESTANDING=0` on the compile line takes it back for a 32-bit system that has them. A C compiler of the other width refuses the file. |
 | `--header out.h` | Also write a header for a C host, declaring the program's `export fn`s, of which there must be one at least. The C then has no `main`: the host calls `goose_init(argc, argv)` once, which runs the program's `main`, and then calls the exported functions; `goose_exit()` ends the program, after which `goose_init` may start it again. |
 | `--include header.h` | Have the generated C include this header, for small shims written against the generated types (spec §7.10). May be repeated. |
 | `--jit` | Also run the program in this process. |

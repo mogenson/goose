@@ -1036,6 +1036,7 @@ inline void CodeGen::EmitPrefixPatch(const string &pref, IntStorage ls, const st
     auto tmp = T(), ms = T();
     L("uint8_t ", tmp, "[10];");
     L("int64_t ", ms, " = gs_uleb_write(", tmp, ", (uint64_t)(", count, "));");
+    CheckSpace(stk, cat(ms, " - 1"));
     L("memmove((", elems, ") + ", ms, " - 1, ", elems, ", (size_t)(", Top(stk), " - (",
       elems, ")));");
     L("GS_MEMCPY(", pref, ", ", tmp, ", (size_t)", ms, ");");
@@ -1141,7 +1142,7 @@ inline void CodeGen::EnsureFromChannels(FnSpec *t) {
         Append(data, "static GS_TLS gs_stack *gs_fdst_", tid, "_", i, ";\n");
         Append(data, "static GS_TLS uint8_t *gs_fval_", tid, "_", i, ";\n");
         if (IsResz(rets[i]))
-            Append(data, "static GS_TLS ", IsFrameObj(rets[i]) ? CT(rets[i]) : string("int64_t"),
+            Append(data, "static GS_TLS ", IsFrameObj(rets[i]) ? CT(rets[i]) : string("gs_len_t"),
                    " gs_lret_", tid, "_", i, ";\n");
     }
 }
